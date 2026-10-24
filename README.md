@@ -1,0 +1,74 @@
+# AutoClicker
+
+一个 Windows 上的**物理级**鼠标 / 键盘连点器。纯 Win32 `SendInput` 注入，多组绑定、独立全局热键、系统托盘常驻、无控制台窗口。
+
+> 使用 Python 3 + tkinter 编写，单文件源码，PyInstaller 打包为单个 exe。
+
+## 功能
+
+- **真实物理点击** —— 通过 `SendInput` 在当前光标位置按下并释放鼠标，不移动光标、不向窗口投递消息，与真人操作走同一条输入链路。
+- **精细的节奏控制** —— 点击间隔（毫秒）、随机波动（在间隔上做 ± 浮动）、按下保持时长、重复次数（0 = 无限）。
+- **四种动作** —— 鼠标左键 / 中键 / 右键，以及键盘按键（支持 Ctrl+A、Shift+F5 这类组合键）。
+- **全局热键** —— 基于 `RegisterHotKey`，程序最小化到托盘、或在别的程序前台时同样响应。热键由用户自己录制，支持任意修饰键组合。
+- **多组绑定** —— 每个绑定拥有独立的热键与独立的点击配置，互不干扰；支持新增、编辑、删除、单独启停。
+- **配置持久化** —— 保存在程序同目录的 `AutoClicker/config.json`，启动自动加载，修改后立即写盘（原子替换）。
+- **三重紧急停止** —— 可配置的全局急停热键（默认 `Ctrl+Alt+K`）、常驻备用 `Ctrl+Alt+F12`、托盘菜单与界面上的红色急停按钮。
+
+## 使用
+
+1. 双击 `AutoClicker.exe` 启动（首次启动会在同目录生成 `AutoClicker/config.json`）。
+2. 点「＋ 新增」，在对话框里点「录制…」按下你要用的热键（例如 `Ctrl+Alt+X`）。
+3. 选择点击动作、填写间隔与波动，保存。
+4. 把鼠标移到目标位置，按一下该热键开始连点；**再按一下即停止**。
+
+关闭主窗口默认只是收进系统托盘，程序仍在后台响应热键；要真正退出请用托盘菜单的「退出」，或托盘右键 → 退出。
+
+### 默认热键
+
+| 用途 | 默认热键 |
+| --- | --- |
+| 示例绑定的启停 | `Ctrl+Alt+X`（可在绑定里改成任意组合） |
+| 紧急停止全部 | `Ctrl+Alt+K`（可在「设置」里改） |
+| 备用紧急停止 | `Ctrl+Alt+F12`（常驻，可在设置里关闭） |
+
+## 从源码运行 / 自行打包
+
+需要 Python 3.9+（必须带 tkinter）。
+
+```bash
+pip install -r requirements.txt
+python src/autoclicker.py           # 直接运行
+```
+
+打包成无控制台的单文件 exe：
+
+```bash
+pip install pyinstaller
+pyinstaller --noconfirm --onefile --noconsole --icon src/icon.ico --name AutoClicker \
+  --hidden-import pynput.keyboard._win32 --hidden-import pynput.mouse._win32 \
+  --hidden-import pystray._win32 src/autoclicker.py
+```
+
+产物在 `dist/AutoClicker.exe`。仓库里不提交 exe，请从 [Releases](../../releases) 下载。
+
+## 实现说明
+
+| 模块 | 做法 |
+| --- | --- |
+| 输入模拟 | `SendInput` + `MOUSEINPUT` / `KEYBDINPUT`，`wScan` 由 `MapVirtualKeyW` 取得，方向键等扩展键带 `KEYEVENTF_EXTENDEDKEY` |
+| 全局热键 | `RegisterHotKey(hwnd=NULL)` 把消息投递到本线程队列，独立线程 `GetMessageW` 循环分发；注册/注销都通过 `PostThreadMessageW` 回到该线程执行 |
+| 键位录制 | `pynput` 低层键盘钩子，仅在录制对话框打开期间存在，录制前会临时注销全部热键避免自触发 |
+| 线程模型 | 每个绑定一个连点线程（用 `Event.wait` 做可中断的精确等待）；子线程从不触碰 tk 控件，界面更新统一投递到队列，由主线程 `after()` 轮询消费 |
+| 托盘 | `pystray` + Pillow 动态生成图标，运行中图标变绿 |
+| 单实例 | 命名 Mutex，重复启动只提示不抢热键 |
+
+## 已知限制
+
+- 仅支持 Windows（依赖 `SendInput` / `RegisterHotKey` / 系统托盘）。
+- 以管理员权限运行的游戏或全屏独占程序可能收不到注入输入，请让两者权限级别一致。
+- 无修饰键的单键热键会全局独占该按键（例如把热键设成 `F8`，其它程序就收不到 `F8`），建议始终带一个修饰键。
+- 热键可能被其它程序占用，此时界面上会提示注册失败。
+
+## 许可
+
+GPL-3.0，见 [LICENSE](LICENSE)。

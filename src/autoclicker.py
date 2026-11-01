@@ -29,7 +29,7 @@ import webbrowser
 from ctypes import wintypes
 
 APP_NAME = "AutoClicker"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 MUTEX_NAME = "Global\\AutoClicker_SingleInstance"
 AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
@@ -96,18 +96,41 @@ def new_id():
     return uuid.uuid4().hex[:10]
 
 
-def default_action(index=1):
-    """一个点击动作: 一次具体的点击 / 按键(多个动作之间并行执行)。"""
+def default_action():
+    """一个点击动作: 一次具体的点击 / 按键(多个动作之间同时开始、各自独立计时)。
+
+    停止条件 stop_mode:
+      infinite —— 一直点到手动停止(再按热键 / 急停 / 别的动作先结束)
+      count    —— 本动作点满 stop_count 次后, 整个绑定的所有动作一起停止
+      duration —— 本动作持续 stop_duration_ms 毫秒后, 整个绑定的所有动作一起停止
+    """
     return {
         "id": new_id(),
         "type": "mouse",             # mouse | keyboard
         "mouse_button": "left",      # left | middle | right
         "kbd": {"mods": [], "vk": 0x74},   # F5
-        "interval_ms": 100,          # 本动作执行后的等待
-        "jitter_ms": 20,
+        "interval_ms": 100,          # 本动作自己的点击间隔
+        "jitter_ms": 20,             # 本动作自己的随机波动
         "hold_ms": 0,
-        "repeat": 0,                 # 本动作连续执行次数, 0 = 不限(一直执行本步)
+        "stop_mode": "infinite",     # infinite | count | duration
+        "stop_count": 0,             # stop_mode=count 时生效
+        "stop_duration_ms": 0,       # stop_mode=duration 时生效
+        "repeat": 0,                 # 兼容旧字段(等于 stop_mode=count 的 stop_count)
     }
+
+
+def action_stop_label(act):
+    """动作的停止条件摘要。"""
+    mode = (act or {}).get("stop_mode") or "infinite"
+    if mode == "count":
+        n = max(0, int(act.get("stop_count", 0)))
+        return "点满 %d 次" % n
+    if mode == "duration":
+        ms = max(0, int(act.get("stop_duration_ms", 0)))
+        if ms >= 1000:
+            return "持续 %.1f 秒" % (ms / 1000.0)
+        return "持续 %d 毫秒" % ms
+    return "一直点"
 
 
 def default_binding(index=1):
@@ -118,8 +141,8 @@ def default_binding(index=1):
         "enabled": True,
         "hotkey": {"mods": ["ctrl", "alt"], "vk": ord("X")},
         "actions": [default_action()],
-        "repeat": 0,                 # 整组总动作次数上限, 0 = 无限
-        "loop": True,                # 一轮跑完后是否循环
+        "repeat": 0,                 # 整组总点击次数上限, 0 = 无限
+        "loop": True,                # 兼容旧字段(不再使用)
     }
 
 
@@ -281,7 +304,8 @@ def _sanitize_action(a, fallback=None):
         act["type"] = a["type"]
     if "mouse_button" in a:
         act["mouse_button"] = a["mouse_button"]
-    for k in ("interval_ms", "jitter_ms", "hold_ms", "repeat"):
+    for k in ("interval_ms", "jitter_ms", "hold_ms", "repeat",
+              "stop_count", "stop_duration_ms"):
         if k in a:
             try:
                 act[k] = max(0, int(a[k]))
@@ -292,6 +316,20 @@ def _sanitize_action(a, fallback=None):
         act["type"] = "mouse"
     if act.get("mouse_button") not in ("left", "middle", "right"):
         act["mouse_button"] = "left"
+    # 停止条件
+    mode = a.get("stop_mode")
+    if mode not in ("infinite", "count", "duration"):
+        # 旧字段 repeat>0 视为"点满 N 次后全部停止"
+        mode = "count" if int(act.get("repeat", 0)) > 0 else "infinite"
+    act["stop_mode"] = mode
+    if mode == "count":
+        n = int(act.get("stop_count", 0)) or int(act.get("repeat", 0))
+        act["stop_count"] = max(1, n)
+    else:
+        act["stop_count"] = max(0, int(act.get("stop_count", 0)))
+    if mode == "duration":
+        act["stop_duration_ms"] = max(1, int(act.get("stop_duration_ms", 0)))
+    act["repeat"] = act["stop_count"] if mode == "count" else 0
     act["interval_ms"] = max(1, int(act.get("interval_ms", 100)))
     if not act.get("id"):
         act["id"] = new_id()
@@ -631,12 +669,22 @@ class ActionRunner(threading.Thread):
     def run(self):
         w = self.worker
         act = self.act
-        repeat = max(0, int(act.get("repeat", 0)))          # 0 = 一直重复到停止
+        # 停止条件: infinite=一直点 / count=点满 N 次 / duration=持续 N 毫秒
+        mode = act.get("stop_mode") or "infinite"
+        if mode not in ("infinite", "count", "duration"):
+            mode = "infinite"
+        limit_n = max(0, int(act.get("stop_count", 0)))
+        limit_ms = max(0, int(act.get("stop_duration_ms", 0)))
         interval = max(1, int(act.get("interval_ms", 100)))
         jitter = max(0, int(act.get("jitter_ms", 0)))
         hold = max(0, int(act.get("hold_ms", 0)))
+
         done = 0
-        while (repeat == 0 or done < repeat) and not w.stop_event.is_set():
+        t0 = time.time()
+        while not w.stop_event.is_set():
+            if mode == "duration" and (time.time() - t0) * 1000.0 >= limit_ms:
+                w.stop_all()          # 本动作到时 -> 整个绑定一起停
+                break
             try:
                 if act.get("type") == "keyboard":
                     keyboard_tap(act.get("kbd") or {})
@@ -645,9 +693,10 @@ class ActionRunner(threading.Thread):
             except Exception:
                 pass
             done += 1
-            if w.tick():          # 达到整组总次数上限
+            if w.tick():              # 达到整组总次数上限
                 break
-            if repeat and done >= repeat:
+            if mode == "count" and done >= limit_n:
+                w.stop_all()          # 本动作点满 -> 整个绑定一起停
                 break
             delay = interval / 1000.0
             if jitter:
@@ -681,6 +730,10 @@ class ClickWorker(threading.Thread):
                 self.stop_event.set()
                 return True
         return False
+
+    def stop_all(self):
+        """某个动作结束 -> 整个绑定的所有动作一起停止。"""
+        self.stop_event.set()
 
     def run(self):
         b = self.binding
@@ -1230,7 +1283,9 @@ class ActionDialog(object):
         self.interval_var = tk.StringVar(value=str(self.action.get("interval_ms", 100)))
         self.jitter_var = tk.StringVar(value=str(self.action.get("jitter_ms", 0)))
         self.hold_var = tk.StringVar(value=str(self.action.get("hold_ms", 0)))
-        self.repeat_var = tk.StringVar(value=str(self.action.get("repeat", 0)))
+        self.stop_var = tk.StringVar(value=(self.action.get("stop_mode") or "infinite"))
+        self.count_var = tk.StringVar(value=str(self.action.get("stop_count") or 10))
+        self.dur_var = tk.StringVar(value=str(self.action.get("stop_duration_ms") or 3000))
 
         row = 0
         ttk.Label(frm, text="动作类型").grid(row=row, column=0, sticky="w", pady=5, padx=(0, 10))
@@ -1250,17 +1305,47 @@ class ActionDialog(object):
         self.kbd_btn.grid(row=row, column=2, padx=6)
         row += 1
 
-        for label, var in (("执行后等待(毫秒)", self.interval_var),
+        for label, var in (("点击间隔(毫秒)", self.interval_var),
                            ("随机波动 ±(毫秒)", self.jitter_var),
-                           ("按下保持(毫秒)", self.hold_var),
-                           ("重复次数(0=不限)", self.repeat_var)):
+                           ("按下保持(毫秒)", self.hold_var)):
             ttk.Label(frm, text=label).grid(row=row, column=0, sticky="w", pady=5)
             ttk.Spinbox(frm, from_=0, to=86400000, textvariable=var, width=12).grid(
                 row=row, column=1, sticky="w", pady=5)
             row += 1
 
-        ttk.Label(frm, text="「重复次数」= 这个动作点几下；0 = 一直点到停止为止。",
-                  foreground=MUTED).grid(row=row, column=0, columnspan=3, sticky="w", pady=(10, 2))
+        # ---- 停止条件 ----
+        ttk.Separator(frm, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=(12, 8))
+        row += 1
+        ttk.Label(frm, text="结束方式").grid(row=row, column=0, sticky="nw", pady=5, padx=(0, 10))
+        sbox = ttk.Frame(frm)
+        sbox.grid(row=row, column=1, columnspan=2, sticky="w")
+
+        r1 = ttk.Frame(sbox)
+        r1.pack(anchor="w", fill="x")
+        ttk.Radiobutton(r1, text="一直点(手动停止)", value="infinite",
+                        variable=self.stop_var, command=self._sync).pack(side="left")
+
+        r2 = ttk.Frame(sbox)
+        r2.pack(anchor="w", fill="x", pady=(4, 0))
+        ttk.Radiobutton(r2, text="点满", value="count",
+                        variable=self.stop_var, command=self._sync).pack(side="left")
+        self.count_spin = ttk.Spinbox(r2, from_=1, to=1000000, textvariable=self.count_var, width=8)
+        self.count_spin.pack(side="left", padx=(4, 0))
+        ttk.Label(r2, text="次后停止").pack(side="left")
+
+        r3 = ttk.Frame(sbox)
+        r3.pack(anchor="w", fill="x", pady=(4, 0))
+        ttk.Radiobutton(r3, text="持续", value="duration",
+                        variable=self.stop_var, command=self._sync).pack(side="left")
+        self.dur_spin = ttk.Spinbox(r3, from_=1, to=86400000, textvariable=self.dur_var, width=8)
+        self.dur_spin.pack(side="left", padx=(4, 0))
+        ttk.Label(r3, text="毫秒后停止").pack(side="left")
+        row += 1
+
+        ttk.Label(frm, text="每个动作独立计时；任一动作到达自己的结束条件，"
+                            "这个热键下的所有点击会一起停止。",
+                  foreground=MUTED, wraplength=420, justify="left").grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(10, 2))
         row += 1
 
         btns = ttk.Frame(frm)
@@ -1281,6 +1366,9 @@ class ActionDialog(object):
         kb = self.type_var.get() == "keyboard"
         self.kbd_btn.configure(state="normal" if kb else "disabled")
         self.kbd_label.configure(foreground=TEXT if kb else MUTED)
+        mode = self.stop_var.get()
+        self.count_spin.configure(state="normal" if mode == "count" else "disabled")
+        self.dur_spin.configure(state="normal" if mode == "duration" else "disabled")
 
     def _record_kbd(self):
         dlg = RecordDialog(self.top, "录制键盘按键", self.action.get("kbd"), allow_single=True)
@@ -1296,14 +1384,35 @@ class ActionDialog(object):
         nums = {}
         for key, var, minimum in (("interval_ms", self.interval_var, 1),
                                   ("jitter_ms", self.jitter_var, 0),
-                                  ("hold_ms", self.hold_var, 0),
-                                  ("repeat", self.repeat_var, 0)):
+                                  ("hold_ms", self.hold_var, 0)):
             try:
                 v = int(float(var.get().strip() or 0))
             except Exception:
                 messagebox.showwarning("数值无效", "请输入有效的整数数值。", parent=self.top)
                 return
             nums[key] = max(minimum, v)
+        mode = self.stop_var.get()
+        nums["stop_mode"] = mode
+        if mode == "count":
+            try:
+                n = int(float(self.count_var.get().strip() or 1))
+            except Exception:
+                messagebox.showwarning("数值无效", "请输入有效的整数数值。", parent=self.top)
+                return
+            nums["stop_count"] = max(1, n)
+            nums["repeat"] = nums["stop_count"]
+        else:
+            nums["stop_count"] = 0
+            nums["repeat"] = 0
+        if mode == "duration":
+            try:
+                ms = int(float(self.dur_var.get().strip() or 1))
+            except Exception:
+                messagebox.showwarning("数值无效", "请输入有效的整数数值。", parent=self.top)
+                return
+            nums["stop_duration_ms"] = max(1, ms)
+        else:
+            nums["stop_duration_ms"] = 0
         if kind == "keyboard":
             self.action["type"] = "keyboard"
         else:
@@ -1364,7 +1473,7 @@ class BindingDialog(object):
         # ---- 动作列表 ----
         ttk.Separator(frm, orient="horizontal").grid(row=row, column=0, columnspan=4, sticky="ew", pady=(12, 8))
         row += 1
-        ttk.Label(frm, text="点击动作（按下热键后这些动作同时开始，各自按自己的节奏重复）").grid(
+        ttk.Label(frm, text="点击动作（同时开始，各自按自己的间隔、波动与结束条件独立运行）").grid(
             row=row, column=0, columnspan=4, sticky="w", pady=(0, 6))
         row += 1
 
@@ -1372,7 +1481,7 @@ class BindingDialog(object):
         box.grid(row=row, column=0, columnspan=4, sticky="ew")
         cols = ("no", "action", "rhythm", "times")
         self.act_tree = ttk.Treeview(box, columns=cols, show="headings", height=4, selectmode="browse")
-        heads = {"no": "#", "action": "动作", "rhythm": "节奏", "times": "重复次数"}
+        heads = {"no": "#", "action": "动作", "rhythm": "节奏", "times": "结束"}
         widths = {"no": 34, "action": 150, "rhythm": 130, "times": 80}
         for c in cols:
             self.act_tree.heading(c, text=heads[c])
@@ -1392,7 +1501,7 @@ class BindingDialog(object):
             ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=(0, 6))
         row += 1
 
-        ttk.Label(frm, text="总点击次数(0=无限)").grid(row=row, column=0, sticky="w", pady=(10, 5))
+        ttk.Label(frm, text="总点击次数上限(0=无限)").grid(row=row, column=0, sticky="w", pady=(10, 5))
         ttk.Spinbox(frm, from_=0, to=86400000, textvariable=self.repeat_var, width=12).grid(
             row=row, column=1, sticky="w", pady=5)
         row += 1
@@ -1400,7 +1509,8 @@ class BindingDialog(object):
         ttk.Label(frm, text="点击位置始终为鼠标光标当前所在位置(不移动、不锁定光标)。",
                   foreground=MUTED).grid(row=row, column=0, columnspan=4, sticky="w", pady=(10, 2))
         row += 1
-        ttk.Label(frm, text="热键为「开关」: 按一次开始，再按一次停止；双击上表行可编辑该动作。",
+        ttk.Label(frm, text="热键为「开关」: 按一次开始，再按一次停止；双击上表行可编辑该动作。\n"
+                            "任一动作先到达自己的结束条件时，本组所有点击会一起停止。",
                   foreground=MUTED).grid(row=row, column=0, columnspan=4, sticky="w")
         row += 1
 
@@ -1424,13 +1534,12 @@ class BindingDialog(object):
         for iid in list(t.get_children()):
             t.delete(iid)
         for i, act in enumerate(self.binding.get("actions") or [], 1):
-            n = int(act.get("repeat", 0))
             jit = int(act.get("jitter_ms", 0))
             rhythm = "%dms" % int(act.get("interval_ms", 100))
             if jit:
                 rhythm += " ±%d" % jit
             t.insert("", "end", iid=str(i - 1),
-                     values=(i, action_label(act), rhythm, ("不限" if n == 0 else "×%d" % n)))
+                     values=(i, action_label(act), rhythm, action_stop_label(act)))
 
     def _index(self):
         sel = self.act_tree.selection()

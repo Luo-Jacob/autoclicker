@@ -4,11 +4,12 @@ AutoClicker —— 物理级鼠标 / 键盘连点器
 
 特性:
   1. 使用 Win32 SendInput 在当前光标位置模拟真实按下/释放(非窗口消息投递)
-  2. 可配置点击间隔、随机波动、按键(左/中/右键 / 键盘按键或组合)
-  3. 全局热键基于 RegisterHotKey, 程序不在前台同样响应
-  4. 多组绑定, 各自独立热键与点击配置
-  5. 配置持久化到程序目录下 AutoClicker/config.json, 启动加载 / 修改即存
-  6. 纯 GUI + 系统托盘, 无控制台窗口; 提供全局急停热键 / 托盘菜单 / 界面按钮三重急停
+  2. 每个绑定是一条动作序列: 一个热键可依次执行多种点击 / 按键
+  3. 每步动作独立配置间隔、随机波动、按下保持、连续次数
+  4. 全局热键基于 RegisterHotKey, 程序不在前台同样响应
+  5. 多组绑定, 各自独立热键与动作序列, 互不干扰
+  6. 配置持久化到程序目录下 AutoClicker/config.json, 启动加载 / 修改即存
+  7. 纯 GUI + 系统托盘, 无控制台窗口; 提供全局急停热键 / 托盘菜单 / 界面按钮三重急停
 """
 
 import ctypes
@@ -23,7 +24,7 @@ import uuid
 from ctypes import wintypes
 
 APP_NAME = "AutoClicker"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 MUTEX_NAME = "Global\\AutoClicker_SingleInstance"
 
 # ---------------------------------------------------------------------------
@@ -81,19 +82,30 @@ def new_id():
     return uuid.uuid4().hex[:10]
 
 
+def default_action(index=1):
+    """动作序列中的一步: 一次具体的点击 / 按键。"""
+    return {
+        "id": new_id(),
+        "type": "mouse",             # mouse | keyboard
+        "mouse_button": "left",      # left | middle | right
+        "kbd": {"mods": [], "vk": 0x74},   # F5
+        "interval_ms": 100,          # 本动作执行后的等待
+        "jitter_ms": 20,
+        "hold_ms": 0,
+        "repeat": 0,                 # 本动作连续执行次数, 0 = 不限(一直执行本步)
+    }
+
+
 def default_binding(index=1):
+    """一个绑定 = 一个热键 + 一组动作序列。"""
     return {
         "id": new_id(),
         "name": "绑定 %d" % index,
         "enabled": True,
         "hotkey": {"mods": ["ctrl", "alt"], "vk": ord("X")},
-        "action": "mouse",           # mouse | keyboard
-        "mouse_button": "left",      # left | middle | right
-        "kbd": {"mods": [], "vk": 0x74},   # F5
-        "interval_ms": 100,
-        "jitter_ms": 20,
-        "hold_ms": 0,
-        "repeat": 0,                 # 0 = 无限
+        "actions": [default_action()],
+        "repeat": 0,                 # 整组总动作次数上限, 0 = 无限
+        "loop": True,                # 一轮跑完后是否循环
     }
 
 
@@ -157,26 +169,40 @@ class Config(object):
                 if not isinstance(item, dict):
                     continue
                 b = default_binding()
-                for k, v in b.items():
-                    if k in item:
-                        b[k] = item[k]
+                if isinstance(item.get("id"), str) and item["id"]:
+                    b["id"] = item["id"]
+                if "name" in item:
+                    b["name"] = item["name"]
                 b["hotkey"] = _sanitize_combo(item.get("hotkey"), b["hotkey"])
-                b["kbd"] = _sanitize_combo(item.get("kbd"), b["kbd"])
-                if b["action"] not in ("mouse", "keyboard"):
-                    b["action"] = "mouse"
-                if b["mouse_button"] not in ("left", "middle", "right"):
-                    b["mouse_button"] = "left"
-                for k in ("interval_ms", "jitter_ms", "hold_ms", "repeat"):
+                acts = item.get("actions")
+                if isinstance(acts, list) and acts:
+                    # 新格式: 动作序列
+                    b["actions"] = [_sanitize_action(a) for a in acts]
+                    if "repeat" in item:
+                        try:
+                            b["repeat"] = max(0, int(item["repeat"]))
+                        except Exception:
+                            b["repeat"] = 0
+                else:
+                    # 旧格式(单动作) -> 迁移成只有一步的序列
+                    legacy = dict(item)
+                    legacy.pop("id", None)
+                    if "action" in legacy:
+                        legacy["type"] = legacy["action"]
+                    b["actions"] = [_sanitize_action(legacy)]
                     try:
-                        b[k] = max(0, int(b[k]))
+                        b["repeat"] = max(0, int(item.get("repeat", 0)))
                     except Exception:
-                        b[k] = 0
-                b["interval_ms"] = max(1, b["interval_ms"])
-                b["enabled"] = bool(b["enabled"])
-                if not b.get("id"):
-                    b["id"] = new_id()
+                        b["repeat"] = 0
+                if "loop" in item:
+                    b["loop"] = bool(item["loop"])
+                b["enabled"] = bool(item.get("enabled", True))
                 cfg["bindings"].append(b)
         return cfg
+
+    @staticmethod
+    def _sanitize_action(a):
+        return _sanitize_action(a)
 
     # ---- 便捷访问 ----
     @property
@@ -205,6 +231,85 @@ def _sanitize_combo(combo, fallback):
     if vk <= 0 or vk > 0xFE:
         vk = int(fallback["vk"])
     return {"mods": mods, "vk": vk}
+
+
+def _sanitize_action(a, fallback=None):
+    act = default_action() if fallback is None else dict(fallback)
+    if not isinstance(a, dict):
+        return act
+    if isinstance(a.get("id"), str) and a["id"]:
+        act["id"] = a["id"]
+    if "type" in a:
+        act["type"] = a["type"]
+    if "mouse_button" in a:
+        act["mouse_button"] = a["mouse_button"]
+    for k in ("interval_ms", "jitter_ms", "hold_ms", "repeat"):
+        if k in a:
+            try:
+                act[k] = max(0, int(a[k]))
+            except Exception:
+                act[k] = 0
+    act["kbd"] = _sanitize_combo(a.get("kbd"), act.get("kbd") or {"mods": [], "vk": 0x74})
+    if act.get("type") not in ("mouse", "keyboard"):
+        act["type"] = "mouse"
+    if act.get("mouse_button") not in ("left", "middle", "right"):
+        act["mouse_button"] = "left"
+    act["interval_ms"] = max(1, int(act.get("interval_ms", 100)))
+    if not act.get("id"):
+        act["id"] = new_id()
+    return act
+
+
+def action_label(act):
+    """动作的一句话摘要。"""
+    if act.get("type") == "keyboard":
+        return "键盘 " + fmt_combo(act.get("kbd"))
+    return {"left": "鼠标左键", "middle": "鼠标中键", "right": "鼠标右键"}.get(
+        act.get("mouse_button", "left"), "鼠标左键")
+
+
+def action_detail(act):
+    """带节奏参数的动作摘要。"""
+    n = int(act.get("repeat", 0))
+    txt = action_label(act)
+    if n:
+        txt += " ×%d" % n
+    jit = int(act.get("jitter_ms", 0))
+    txt += " · %dms" % int(act.get("interval_ms", 100))
+    if jit:
+        txt += "±%d" % jit
+    return txt
+
+
+def binding_rhythm(binding, limit=2):
+    """绑定的节奏摘要(各步间隔)。"""
+    acts = binding.get("actions") or []
+    if not acts:
+        return "—"
+    parts = []
+    for a in acts[:limit]:
+        jit = int(a.get("jitter_ms", 0))
+        t = "%d" % int(a.get("interval_ms", 100))
+        if jit:
+            t += "±%d" % jit
+        parts.append(t)
+    txt = " / ".join(parts)
+    if len(acts) > limit:
+        txt += " …"
+    return txt
+
+
+def binding_summary(binding, limit=2):
+    """绑定的动作序列摘要, 用于列表显示。"""
+    acts = binding.get("actions") or []
+    if not acts:
+        return "（无动作）"
+    parts = [action_label(a) for a in acts]
+    if len(parts) <= limit:
+        txt = " → ".join(parts)
+    else:
+        txt = " → ".join(parts[:limit]) + " → …共%d步" % len(parts)
+    return txt
 
 
 # ---------------------------------------------------------------------------
@@ -489,35 +594,60 @@ class ClickWorker(threading.Thread):
 
     def run(self):
         b = self.binding
-        interval = max(1, int(b.get("interval_ms", 100)))
-        jitter = max(0, int(b.get("jitter_ms", 0)))
-        hold = max(0, int(b.get("hold_ms", 0)))
-        repeat = max(0, int(b.get("repeat", 0)))
-        action = b.get("action", "mouse")
-        button = b.get("mouse_button", "left")
+        total = max(0, int(b.get("repeat", 0)))       # 整组总次数上限, 0=无限
+        loop = bool(b.get("loop", True))              # 一轮跑完是否循环
+        if not (b.get("actions") or []):
+            if self.on_stop:
+                try:
+                    self.on_stop(b["id"])
+                except Exception:
+                    pass
+            return
         while not self.stop_event.is_set():
-            try:
-                if action == "keyboard":
-                    keyboard_tap(b.get("kbd") or {})
-                else:
-                    mouse_click(button, hold)
-            except Exception:
-                pass
-            self.count += 1
-            if repeat and self.count >= repeat:
-                break
-            delay = interval / 1000.0
-            if jitter:
-                delay += random.uniform(-jitter, jitter) / 1000.0
-            if delay < 0.001:
-                delay = 0.001
-            if self.stop_event.wait(delay):
+            finished = False
+            for act in (b.get("actions") or []):
+                if self.stop_event.is_set():
+                    finished = True
+                    break
+                if not self._run_step(act, total):
+                    # 本步返回 False: 收到停止信号, 或已达到总次数上限
+                    finished = True
+                    break
+            if finished or not loop:
                 break
         if self.on_stop:
             try:
                 self.on_stop(b["id"])
             except Exception:
                 pass
+
+    def _run_step(self, act, total):
+        """执行序列中的一步; 返回 False 表示本轮应结束。"""
+        step_repeat = max(0, int(act.get("repeat", 0)))   # 0=本步无限
+        interval = max(1, int(act.get("interval_ms", 100)))
+        jitter = max(0, int(act.get("jitter_ms", 0)))
+        hold = max(0, int(act.get("hold_ms", 0)))
+        done = 0
+        while (step_repeat == 0 or done < step_repeat) and not self.stop_event.is_set():
+            try:
+                if act.get("type") == "keyboard":
+                    keyboard_tap(act.get("kbd") or {})
+                else:
+                    mouse_click(act.get("mouse_button", "left"), hold)
+            except Exception:
+                pass
+            self.count += 1
+            done += 1
+            if total and self.count >= total:
+                return False
+            delay = interval / 1000.0
+            if jitter:
+                delay += random.uniform(-jitter, jitter) / 1000.0
+            if delay < 0.001:
+                delay = 0.001
+            if self.stop_event.wait(delay):
+                return False
+        return not self.stop_event.is_set()
 
     def stop(self):
         self.stop_event.set()
@@ -533,6 +663,7 @@ class Engine(object):
         self.config = config
         self.hotkeys = HotkeyManager()
         self._workers = {}
+        self._last_count = {}          # 上一次运行的点击总数(停止后仍可显示)
         self._lock = threading.RLock()
         self.on_change = lambda: None      # 状态变化回调(UI 更新)
         self.on_error = lambda msg: None
@@ -546,7 +677,9 @@ class Engine(object):
     def click_count(self, bid):
         with self._lock:
             w = self._workers.get(bid)
-            return w.count if w else 0
+            if w is not None:
+                return w.count
+            return int(self._last_count.get(bid, 0))
 
     def running_ids(self):
         with self._lock:
@@ -561,6 +694,7 @@ class Engine(object):
             old = self._workers.get(bid)
             if old and old.is_alive():
                 return True
+            self._last_count.pop(bid, None)
             w = ClickWorker(b, on_stop=self._worker_finished)
             self._workers[bid] = w
             w.start()
@@ -570,6 +704,8 @@ class Engine(object):
     def stop(self, bid):
         with self._lock:
             w = self._workers.pop(bid, None)
+            if w is not None:
+                self._last_count[bid] = w.count
         if w:
             w.stop()
         self.on_change()
@@ -593,6 +729,7 @@ class Engine(object):
             w = self._workers.get(bid)
             if w and w is threading.current_thread():
                 self._workers.pop(bid, None)
+                self._last_count[bid] = w.count
         self.on_change()
 
     # ---- 热键注册 ----
@@ -882,11 +1019,127 @@ class RecordDialog(object):
         self.top.destroy()
 
 
+class ActionDialog(object):
+    """编辑动作序列中的一步(一次点击 / 一次按键)。"""
+
+    def __init__(self, parent, action, title="编辑动作"):
+        self.action = json.loads(json.dumps(action)) if action else default_action()
+        self.result = None
+        self.top = tk.Toplevel(parent)
+        self.top.title(title)
+        self.top.configure(bg=BG)
+        self.top.transient(parent)
+        self.top.resizable(False, False)
+        self.top.grab_set()
+        self.top.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        frm = ttk.Frame(self.top, padding=16)
+        frm.pack(fill="both", expand=True)
+
+        self.type_var = tk.StringVar(
+            value=("keyboard" if self.action.get("type") == "keyboard"
+                   else self.action.get("mouse_button", "left")))
+        self.kbd_var = tk.StringVar(value=fmt_combo(self.action.get("kbd")))
+        self.interval_var = tk.StringVar(value=str(self.action.get("interval_ms", 100)))
+        self.jitter_var = tk.StringVar(value=str(self.action.get("jitter_ms", 0)))
+        self.hold_var = tk.StringVar(value=str(self.action.get("hold_ms", 0)))
+        self.repeat_var = tk.StringVar(value=str(self.action.get("repeat", 0)))
+
+        row = 0
+        ttk.Label(frm, text="动作类型").grid(row=row, column=0, sticky="w", pady=5, padx=(0, 10))
+        bar = ttk.Frame(frm)
+        bar.grid(row=row, column=1, columnspan=2, sticky="w")
+        for text, val in (("鼠标左键", "left"), ("鼠标中键", "middle"),
+                          ("鼠标右键", "right"), ("键盘按键", "keyboard")):
+            ttk.Radiobutton(bar, text=text, value=val, variable=self.type_var,
+                            command=self._sync).pack(side="left", padx=(0 if val == "left" else 8, 0))
+        row += 1
+
+        self.kbd_label = ttk.Label(frm, text="按键")
+        self.kbd_label.grid(row=row, column=0, sticky="w", pady=5)
+        self.kbd_entry = ttk.Entry(frm, textvariable=self.kbd_var, width=22, state="readonly")
+        self.kbd_entry.grid(row=row, column=1, sticky="ew", pady=5)
+        self.kbd_btn = ttk.Button(frm, text="录制…", command=self._record_kbd, width=8)
+        self.kbd_btn.grid(row=row, column=2, padx=6)
+        row += 1
+
+        for label, var in (("执行后等待(毫秒)", self.interval_var),
+                           ("随机波动 ±(毫秒)", self.jitter_var),
+                           ("按下保持(毫秒)", self.hold_var),
+                           ("连续次数(0=不限)", self.repeat_var)):
+            ttk.Label(frm, text=label).grid(row=row, column=0, sticky="w", pady=5)
+            ttk.Spinbox(frm, from_=0, to=86400000, textvariable=var, width=12).grid(
+                row=row, column=1, sticky="w", pady=5)
+            row += 1
+
+        ttk.Label(frm, text="「连续次数」= 本步连续做几次再进入下一步，0 表示一直重复本步。",
+                  foreground=MUTED).grid(row=row, column=0, columnspan=3, sticky="w", pady=(10, 2))
+        row += 1
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=row, column=0, columnspan=3, sticky="e", pady=(16, 0))
+        ttk.Button(btns, text="取消", command=self._cancel).pack(side="right")
+        ttk.Button(btns, text="保存", command=self._save, style="Accent.TButton").pack(side="right", padx=(0, 8))
+
+        frm.columnconfigure(1, weight=1)
+        self._sync()
+        self.top.update_idletasks()
+        try:
+            self.top.geometry("+%d+%d" % (parent.winfo_rootx() + 80, parent.winfo_rooty() + 60))
+        except Exception:
+            pass
+        parent.wait_window(self.top)
+
+    def _sync(self):
+        kb = self.type_var.get() == "keyboard"
+        self.kbd_btn.configure(state="normal" if kb else "disabled")
+        self.kbd_label.configure(foreground=TEXT if kb else MUTED)
+
+    def _record_kbd(self):
+        dlg = RecordDialog(self.top, "录制键盘按键", self.action.get("kbd"), allow_single=True)
+        if dlg.result:
+            self.action["kbd"] = dlg.result
+            self.kbd_var.set(fmt_combo(dlg.result))
+
+    def _save(self):
+        kind = self.type_var.get()
+        if kind == "keyboard" and not (self.action.get("kbd") or {}).get("vk"):
+            messagebox.showwarning("缺少按键", "请先录制要模拟的键盘按键。", parent=self.top)
+            return
+        nums = {}
+        for key, var, minimum in (("interval_ms", self.interval_var, 1),
+                                  ("jitter_ms", self.jitter_var, 0),
+                                  ("hold_ms", self.hold_var, 0),
+                                  ("repeat", self.repeat_var, 0)):
+            try:
+                v = int(float(var.get().strip() or 0))
+            except Exception:
+                messagebox.showwarning("数值无效", "请输入有效的整数数值。", parent=self.top)
+                return
+            nums[key] = max(minimum, v)
+        if kind == "keyboard":
+            self.action["type"] = "keyboard"
+        else:
+            self.action["type"] = "mouse"
+            self.action["mouse_button"] = kind
+        self.action.update(nums)
+        self.result = self.action
+        self.top.grab_release()
+        self.top.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.top.grab_release()
+        self.top.destroy()
+
+
 class BindingDialog(object):
-    """新增 / 编辑绑定。"""
+    """新增 / 编辑绑定: 一个热键 + 一组按顺序执行的动作序列。"""
 
     def __init__(self, parent, binding, existing):
         self.binding = json.loads(json.dumps(binding))  # 副本
+        if not self.binding.get("actions"):
+            self.binding["actions"] = [default_action()]
         self.existing = existing
         self.ok = False
         self.top = tk.Toplevel(parent)
@@ -902,25 +1155,13 @@ class BindingDialog(object):
 
         self.name_var = tk.StringVar(value=self.binding.get("name", ""))
         self.enabled_var = tk.BooleanVar(value=bool(self.binding.get("enabled", True)))
-        self.action_var = tk.StringVar(
-            value=("keyboard" if self.binding.get("action") == "keyboard"
-                   else self.binding.get("mouse_button", "left")))
-        self.interval_var = tk.StringVar(value=str(self.binding.get("interval_ms", 100)))
-        self.jitter_var = tk.StringVar(value=str(self.binding.get("jitter_ms", 0)))
-        self.hold_var = tk.StringVar(value=str(self.binding.get("hold_ms", 0)))
+        self.loop_var = tk.BooleanVar(value=bool(self.binding.get("loop", True)))
         self.repeat_var = tk.StringVar(value=str(self.binding.get("repeat", 0)))
         self.hk_var = tk.StringVar(value=fmt_combo(self.binding.get("hotkey")))
-        self.kbd_var = tk.StringVar(value=fmt_combo(self.binding.get("kbd")))
 
         row = 0
 
-        def add(label, widget):
-            nonlocal row
-            ttk.Label(frm, text=label).grid(row=row, column=0, sticky="w", pady=5, padx=(0, 10))
-            widget.grid(row=row, column=1, columnspan=3, sticky="ew", pady=5)
-            row += 1
-
-        ttk.Label(frm, text="名称").grid(row=row, column=0, sticky="w", pady=5)
+        ttk.Label(frm, text="名称").grid(row=row, column=0, sticky="w", pady=5, padx=(0, 10))
         ttk.Entry(frm, textvariable=self.name_var, width=30).grid(row=row, column=1, columnspan=3, sticky="ew", pady=5)
         row += 1
 
@@ -928,64 +1169,150 @@ class BindingDialog(object):
             row=row, column=1, columnspan=3, sticky="w", pady=(2, 6))
         row += 1
 
-        # 热键
         ttk.Label(frm, text="启动/停止热键").grid(row=row, column=0, sticky="w", pady=5)
         e = ttk.Entry(frm, textvariable=self.hk_var, width=22, state="readonly")
         e.grid(row=row, column=1, sticky="ew", pady=5)
         ttk.Button(frm, text="录制…", command=self._record_hotkey, width=8).grid(row=row, column=2, padx=6)
         row += 1
 
-        # 动作
-        ttk.Label(frm, text="点击动作").grid(row=row, column=0, sticky="w", pady=5)
-        act = ttk.Frame(frm)
-        act.grid(row=row, column=1, columnspan=3, sticky="w")
-        for text, val in (("鼠标左键", "left"), ("鼠标中键", "middle"),
-                          ("鼠标右键", "right"), ("键盘按键", "keyboard")):
-            ttk.Radiobutton(act, text=text, value=val, variable=self.action_var,
-                            command=self._sync).pack(side="left", padx=(0 if val == "left" else 8, 0))
+        # ---- 动作序列 ----
+        ttk.Separator(frm, orient="horizontal").grid(row=row, column=0, columnspan=4, sticky="ew", pady=(12, 8))
+        row += 1
+        ttk.Label(frm, text="动作序列（一个热键可依次执行多种点击）").grid(
+            row=row, column=0, columnspan=4, sticky="w", pady=(0, 6))
         row += 1
 
-        ttk.Label(frm, text="键盘按键").grid(row=row, column=0, sticky="w", pady=5)
-        self.kbd_entry = ttk.Entry(frm, textvariable=self.kbd_var, width=22, state="readonly")
-        self.kbd_entry.grid(row=row, column=1, sticky="ew", pady=5)
-        self.kbd_btn = ttk.Button(frm, text="录制…", command=self._record_kbd, width=8)
-        self.kbd_btn.grid(row=row, column=2, padx=6)
-        row += 1
-
-        for label, var in (("间隔(毫秒)", self.interval_var),
-                           ("随机波动 ±(毫秒)", self.jitter_var),
-                           ("按下保持(毫秒)", self.hold_var),
-                           ("重复次数(0=无限)", self.repeat_var)):
-            ttk.Label(frm, text=label).grid(row=row, column=0, sticky="w", pady=5)
-            ttk.Spinbox(frm, from_=0, to=86400000, textvariable=var, width=12).grid(
-                row=row, column=1, sticky="w", pady=5)
-            row += 1
-
-        ttk.Label(frm, text="点击位置: 始终为鼠标光标当前所在位置(不移动、不锁定光标)。",
-                  foreground=MUTED).grid(row=row, column=0, columnspan=4, sticky="w", pady=(10, 2))
-        row += 1
-        ttk.Label(frm, text="热键为「开关」: 按一次开始连点, 再按一次停止。",
-                  foreground=MUTED).grid(row=row, column=0, columnspan=4, sticky="w")
+        box = ttk.Frame(frm)
+        box.grid(row=row, column=0, columnspan=4, sticky="ew")
+        cols = ("no", "action", "rhythm", "times")
+        self.act_tree = ttk.Treeview(box, columns=cols, show="headings", height=4, selectmode="browse")
+        heads = {"no": "#", "action": "动作", "rhythm": "节奏", "times": "连续次数"}
+        widths = {"no": 34, "action": 150, "rhythm": 130, "times": 80}
+        for c in cols:
+            self.act_tree.heading(c, text=heads[c])
+            self.act_tree.column(c, width=widths[c], anchor="center" if c != "action" else "w")
+        self.act_tree.pack(side="left", fill="x", expand=True)
+        sb = ttk.Scrollbar(box, orient="vertical", command=self.act_tree.yview)
+        sb.pack(side="right", fill="y")
+        self.act_tree.configure(yscrollcommand=sb.set)
+        self.act_tree.bind("<Double-1>", lambda ev: self._edit_action())
         row += 1
 
         bar = ttk.Frame(frm)
-        bar.grid(row=row, column=0, columnspan=4, sticky="e", pady=(16, 0))
-        ttk.Button(bar, text="取消", command=self._cancel).pack(side="right")
-        ttk.Button(bar, text="保存", command=self._save, style="Accent.TButton").pack(side="right", padx=(0, 8))
+        bar.grid(row=row, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        for text, cmd in (("＋ 添加", self._add_action), ("编辑", self._edit_action),
+                          ("复制", self._dup_action), ("删除", self._del_action),
+                          ("↑ 上移", self._move_up), ("↓ 下移", self._move_down)):
+            ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=(0, 6))
+        row += 1
+
+        ttk.Checkbutton(frm, text="循环执行序列（取消勾选则跑完一轮自动停止）",
+                        variable=self.loop_var).grid(row=row, column=1, columnspan=3, sticky="w", pady=(10, 4))
+        row += 1
+
+        ttk.Label(frm, text="总执行次数(0=无限)").grid(row=row, column=0, sticky="w", pady=5)
+        ttk.Spinbox(frm, from_=0, to=86400000, textvariable=self.repeat_var, width=12).grid(
+            row=row, column=1, sticky="w", pady=5)
+        row += 1
+
+        ttk.Label(frm, text="点击位置始终为鼠标光标当前所在位置(不移动、不锁定光标)。",
+                  foreground=MUTED).grid(row=row, column=0, columnspan=4, sticky="w", pady=(10, 2))
+        row += 1
+        ttk.Label(frm, text="热键为「开关」: 按一次开始，再按一次停止；双击上表行可编辑该步。",
+                  foreground=MUTED).grid(row=row, column=0, columnspan=4, sticky="w")
+        row += 1
+
+        bar2 = ttk.Frame(frm)
+        bar2.grid(row=row, column=0, columnspan=4, sticky="e", pady=(16, 0))
+        ttk.Button(bar2, text="取消", command=self._cancel).pack(side="right")
+        ttk.Button(bar2, text="保存", command=self._save, style="Accent.TButton").pack(side="right", padx=(0, 8))
 
         frm.columnconfigure(1, weight=1)
-        self._sync()
+        self._refresh_actions()
         self.top.update_idletasks()
         try:
-            self.top.geometry("+%d+%d" % (parent.winfo_rootx() + 60, parent.winfo_rooty() + 40))
+            self.top.geometry("+%d+%d" % (parent.winfo_rootx() + 40, parent.winfo_rooty() + 20))
         except Exception:
             pass
         parent.wait_window(self.top)
 
-    def _sync(self):
-        kb = self.action_var.get() == "keyboard"
-        self.kbd_entry.configure(state="readonly")
-        self.kbd_btn.configure(state="normal" if kb else "disabled")
+    # ---- 动作序列 ----
+    def _refresh_actions(self):
+        t = self.act_tree
+        for iid in list(t.get_children()):
+            t.delete(iid)
+        for i, act in enumerate(self.binding.get("actions") or [], 1):
+            n = int(act.get("repeat", 0))
+            jit = int(act.get("jitter_ms", 0))
+            rhythm = "%dms" % int(act.get("interval_ms", 100))
+            if jit:
+                rhythm += " ±%d" % jit
+            t.insert("", "end", iid=str(i - 1),
+                     values=(i, action_label(act), rhythm, ("不限" if n == 0 else "×%d" % n)))
+
+    def _index(self):
+        sel = self.act_tree.selection()
+        if not sel:
+            return None
+        try:
+            return int(sel[0])
+        except Exception:
+            return None
+
+    def _add_action(self):
+        dlg = ActionDialog(self.top, default_action(), "添加动作")
+        if dlg.result:
+            self.binding.setdefault("actions", []).append(dlg.result)
+            self._refresh_actions()
+
+    def _edit_action(self):
+        i = self._index()
+        if i is None:
+            messagebox.showinfo("提示", "请先选中要编辑的步骤。", parent=self.top)
+            return
+        dlg = ActionDialog(self.top, self.binding["actions"][i], "编辑动作")
+        if dlg.result:
+            self.binding["actions"][i] = dlg.result
+            self._refresh_actions()
+            self.act_tree.selection_set(str(i))
+
+    def _dup_action(self):
+        i = self._index()
+        if i is None:
+            return
+        copy = json.loads(json.dumps(self.binding["actions"][i]))
+        copy["id"] = new_id()
+        self.binding["actions"].insert(i + 1, copy)
+        self._refresh_actions()
+        self.act_tree.selection_set(str(i + 1))
+
+    def _del_action(self):
+        i = self._index()
+        if i is None:
+            return
+        if len(self.binding["actions"]) <= 1:
+            messagebox.showinfo("提示", "至少保留一个动作。", parent=self.top)
+            return
+        self.binding["actions"].pop(i)
+        self._refresh_actions()
+
+    def _move(self, delta):
+        i = self._index()
+        if i is None:
+            return
+        j = i + delta
+        acts = self.binding["actions"]
+        if j < 0 or j >= len(acts):
+            return
+        acts[i], acts[j] = acts[j], acts[i]
+        self._refresh_actions()
+        self.act_tree.selection_set(str(j))
+
+    def _move_up(self):
+        self._move(-1)
+
+    def _move_down(self):
+        self._move(1)
 
     def _record_hotkey(self):
         dlg = RecordDialog(self.top, "录制热键", self.binding.get("hotkey"), allow_single=False)
@@ -993,40 +1320,29 @@ class BindingDialog(object):
             self.binding["hotkey"] = dlg.result
             self.hk_var.set(fmt_combo(dlg.result))
 
-    def _record_kbd(self):
-        dlg = RecordDialog(self.top, "录制键盘按键", self.binding.get("kbd"), allow_single=True)
-        if dlg.result:
-            self.binding["kbd"] = dlg.result
-            self.kbd_var.set(fmt_combo(dlg.result))
-
     def _save(self):
         name = self.name_var.get().strip() or "绑定"
         if not self.binding.get("hotkey") or not self.binding["hotkey"].get("vk"):
             messagebox.showwarning("缺少热键", "请先为该绑定录制一个启动/停止热键。", parent=self.top)
             return
-        act = self.action_var.get()
-        if act == "keyboard" and not self.binding.get("kbd", {}).get("vk"):
-            messagebox.showwarning("缺少按键", "请选择要模拟的键盘按键。", parent=self.top)
+        acts = self.binding.get("actions") or []
+        if not acts:
+            messagebox.showwarning("缺少动作", "请至少添加一个点击动作。", parent=self.top)
             return
-        nums = {}
-        for key, var, minimum in (("interval_ms", self.interval_var, 1),
-                                  ("jitter_ms", self.jitter_var, 0),
-                                  ("hold_ms", self.hold_var, 0),
-                                  ("repeat", self.repeat_var, 0)):
-            try:
-                v = int(float(var.get().strip() or 0))
-            except Exception:
-                messagebox.showwarning("数值无效", "请输入有效的整数数值。", parent=self.top)
+        for act in acts:
+            if act.get("type") == "keyboard" and not (act.get("kbd") or {}).get("vk"):
+                messagebox.showwarning("缺少按键", "序列中有键盘动作未录制按键。", parent=self.top)
                 return
-            nums[key] = max(minimum, v)
+        try:
+            total = int(float(self.repeat_var.get().strip() or 0))
+        except Exception:
+            messagebox.showwarning("数值无效", "请输入有效的整数数值。", parent=self.top)
+            return
         self.binding["name"] = name
         self.binding["enabled"] = bool(self.enabled_var.get())
-        if act == "keyboard":
-            self.binding["action"] = "keyboard"
-        else:
-            self.binding["action"] = "mouse"
-            self.binding["mouse_button"] = act
-        self.binding.update(nums)
+        self.binding["loop"] = bool(self.loop_var.get())
+        self.binding["repeat"] = max(0, total)
+        self.binding["actions"] = acts
         self.ok = True
         self.top.grab_release()
         self.top.destroy()
@@ -1130,8 +1446,8 @@ class App(object):
         self._closing = False
 
         self.root.title("%s  v%s" % (APP_NAME, APP_VERSION))
-        self.root.geometry("780x520")
-        self.root.minsize(680, 440)
+        self.root.geometry("860x540")
+        self.root.minsize(760, 460)
         self.root.configure(bg=BG)
 
         self._style()
@@ -1197,8 +1513,8 @@ class App(object):
         self.tree = ttk.Treeview(wrap, columns=cols, show="headings", selectmode="browse")
         heads = {"status": "状态", "name": "名称", "hotkey": "热键", "action": "点击动作",
                  "interval": "间隔(ms)", "count": "已点击"}
-        widths = {"status": 110, "name": 130, "hotkey": 150, "action": 150,
-                  "interval": 110, "count": 90}
+        widths = {"status": 110, "name": 120, "hotkey": 130, "action": 200,
+                  "interval": 110, "count": 80}
         for c in cols:
             self.tree.heading(c, text=heads[c])
             self.tree.column(c, width=widths[c], anchor="center" if c != "name" and c != "action" else "w")
@@ -1233,14 +1549,8 @@ class App(object):
                 status = "● 运行中"
             else:
                 status = "○ 已停止"
-            if b["action"] == "keyboard":
-                action = "键盘 " + fmt_combo(b.get("kbd"))
-            else:
-                action = {"left": "鼠标左键", "middle": "鼠标中键", "right": "鼠标右键"}[b.get("mouse_button", "left")]
-            jit = int(b.get("jitter_ms", 0))
-            interval = "%d" % int(b.get("interval_ms", 100))
-            if jit:
-                interval += " ±%d" % jit
+            action = binding_summary(b)
+            interval = binding_rhythm(b)
             values = (status, b.get("name", ""), fmt_combo(b.get("hotkey")),
                       action, interval, str(self.engine.click_count(b["id"])))
             if tree.exists(b["id"]):

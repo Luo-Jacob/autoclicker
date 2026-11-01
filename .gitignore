@@ -5,9 +5,11 @@ dist/
 *.exe
 *.manifest
 
-# 运行时生成的配置
+# 运行时生成的配置与背景图
+AClib/
 AutoClicker/
 config.json
+pictures/
 
 # Python
 __pycache__/

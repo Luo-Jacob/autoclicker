@@ -2,12 +2,15 @@
 """
 AutoClicker —— 物理级鼠标 / 键盘连点器
 
+由 Luo-Jacob 制作 · https://github.com/Luo-Jacob/autoclicker
+MIT License · Copyright (c) 2026 Luo-Jacob
+
 特性:
   1. 使用 Win32 SendInput 在当前光标位置模拟真实按下/释放(非窗口消息投递)
-  2. 每个绑定是一条动作序列: 一个热键可依次执行多种点击 / 按键
-  3. 每步动作独立配置间隔、随机波动、按下保持、连续次数
+  2. 一个热键可挂载多个动作: 按下热键后这些动作同时开始, 各自并行重复
+  3. 每个动作独立配置间隔、随机波动、按下保持、重复次数
   4. 全局热键基于 RegisterHotKey, 程序不在前台同样响应
-  5. 多组绑定, 各自独立热键与动作序列, 互不干扰
+  5. 多组绑定, 各自独立热键与动作配置, 互不干扰
   6. 配置持久化到程序目录下 AutoClicker/config.json, 启动加载 / 修改即存
   7. 纯 GUI + 系统托盘, 无控制台窗口; 提供全局急停热键 / 托盘菜单 / 界面按钮三重急停
 """
@@ -17,15 +20,18 @@ import json
 import os
 import queue
 import random
+import shutil
 import sys
 import threading
 import time
 import uuid
+import webbrowser
 from ctypes import wintypes
 
 APP_NAME = "AutoClicker"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 MUTEX_NAME = "Global\\AutoClicker_SingleInstance"
+AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 # ---------------------------------------------------------------------------
 # 无控制台环境兜底(noconsole 打包时 sys.stdout 可能为 None)
@@ -70,8 +76,16 @@ def base_dir():
     return d
 
 
-CONFIG_DIR = os.path.join(base_dir(), "AutoClicker")
+CONFIG_DIR = os.path.join(base_dir(), "AClib")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+PICTURES_DIR = os.path.join(CONFIG_DIR, "pictures")
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif")
+# 旧版本配置目录, 仅用于首次启动时迁移
+LEGACY_CONFIG_FILES = [
+    os.path.join(base_dir(), "AutoClicker", "config.json"),
+]
+PROJECT_URL = "https://github.com/Luo-Jacob/autoclicker"
+AUTHOR = "Luo-Jacob"
 
 MOD_CTRL, MOD_ALT, MOD_SHIFT, MOD_WIN = 0x0002, 0x0001, 0x0004, 0x0008
 MOD_NOREPEAT = 0x4000
@@ -83,7 +97,7 @@ def new_id():
 
 
 def default_action(index=1):
-    """动作序列中的一步: 一次具体的点击 / 按键。"""
+    """一个点击动作: 一次具体的点击 / 按键(多个动作之间并行执行)。"""
     return {
         "id": new_id(),
         "type": "mouse",             # mouse | keyboard
@@ -97,7 +111,7 @@ def default_action(index=1):
 
 
 def default_binding(index=1):
-    """一个绑定 = 一个热键 + 一组动作序列。"""
+    """一个绑定 = 一个热键 + 一组同时执行的点击动作。"""
     return {
         "id": new_id(),
         "name": "绑定 %d" % index,
@@ -111,12 +125,15 @@ def default_binding(index=1):
 
 def default_config():
     return {
-        "version": 1,
+        "version": 2,
         "settings": {
             "emergency_hotkey": {"mods": ["ctrl", "alt"], "vk": ord("K")},
             "panic_fallback": True,   # 始终启用 Ctrl+Alt+F12 备用急停
-            "close_to_tray": True,
-            "start_hidden": False,
+            "close_action": "tray",   # tray = 关窗最小化到托盘 | quit = 关窗直接退出程序
+            "start_hidden": False,    # 启动后不显示主界面, 仅托盘
+            "autostart": False,       # 开机自动启动(注册表 Run)
+            "theme": "light",         # light | dark
+            "background": "",         # 界面背景图文件名(位于 AClib/pictures), 空=无背景
         },
         "bindings": [],
     }
@@ -131,10 +148,19 @@ class Config(object):
     # ---- 读写 ----
     def load(self):
         try:
-            if os.path.isfile(CONFIG_FILE):
-                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            path = CONFIG_FILE
+            if not os.path.isfile(path):
+                # 迁移旧版本配置(AutoClicker/config.json)
+                for legacy in LEGACY_CONFIG_FILES:
+                    if os.path.isfile(legacy):
+                        path = legacy
+                        break
+            if os.path.isfile(path):
+                with open(path, "r", encoding="utf-8") as f:
                     raw = json.load(f)
                 self.data = self._sanitize(raw)
+                if path != CONFIG_FILE:
+                    self.save()
         except Exception:
             self.data = default_config()
 
@@ -158,11 +184,23 @@ class Config(object):
             return cfg
         st = raw.get("settings")
         if isinstance(st, dict):
-            for k, v in cfg["settings"].items():
+            s = cfg["settings"]
+            for k in list(s.keys()):
                 if k in st:
-                    cfg["settings"][k] = st[k]
-            cfg["settings"]["emergency_hotkey"] = _sanitize_combo(
-                st.get("emergency_hotkey"), cfg["settings"]["emergency_hotkey"])
+                    s[k] = st[k]
+            s["emergency_hotkey"] = _sanitize_combo(
+                st.get("emergency_hotkey"), s["emergency_hotkey"])
+            # v1 -> v2: 旧的 close_to_tray 布尔换成 close_action
+            if "close_action" not in st and "close_to_tray" in st:
+                s["close_action"] = "tray" if st.get("close_to_tray") else "quit"
+            if s.get("close_action") not in ("tray", "quit"):
+                s["close_action"] = "tray"
+            if s.get("theme") not in ("light", "dark"):
+                s["theme"] = "light"
+            s["background"] = str(s.get("background") or "")
+            s["autostart"] = bool(s.get("autostart"))
+            s["panic_fallback"] = bool(s.get("panic_fallback", True))
+            s["start_hidden"] = bool(s.get("start_hidden", False))
         bl = raw.get("bindings")
         if isinstance(bl, list):
             for item in bl:
@@ -299,17 +337,15 @@ def binding_rhythm(binding, limit=2):
     return txt
 
 
-def binding_summary(binding, limit=2):
-    """绑定的动作序列摘要, 用于列表显示。"""
+def binding_summary(binding, limit=3):
+    """绑定的动作摘要(多个动作是同时执行的, 用 + 连接)。"""
     acts = binding.get("actions") or []
     if not acts:
         return "（无动作）"
     parts = [action_label(a) for a in acts]
     if len(parts) <= limit:
-        txt = " → ".join(parts)
-    else:
-        txt = " → ".join(parts[:limit]) + " → …共%d步" % len(parts)
-    return txt
+        return " + ".join(parts)
+    return " + ".join(parts[:limit]) + " + …共%d项" % len(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -582,7 +618,49 @@ class HotkeyManager(threading.Thread):
 # ---------------------------------------------------------------------------
 # 连点工作线程
 # ---------------------------------------------------------------------------
+class ActionRunner(threading.Thread):
+    """绑定中的一个动作: 按自己的节奏独立重复。多个动作之间是同时开始、并行执行的。"""
+
+    def __init__(self, act, index, worker):
+        threading.Thread.__init__(self)
+        self.daemon = True
+        self.name = "ActionRunner-%d" % index
+        self.act = act or {}
+        self.worker = worker
+
+    def run(self):
+        w = self.worker
+        act = self.act
+        repeat = max(0, int(act.get("repeat", 0)))          # 0 = 一直重复到停止
+        interval = max(1, int(act.get("interval_ms", 100)))
+        jitter = max(0, int(act.get("jitter_ms", 0)))
+        hold = max(0, int(act.get("hold_ms", 0)))
+        done = 0
+        while (repeat == 0 or done < repeat) and not w.stop_event.is_set():
+            try:
+                if act.get("type") == "keyboard":
+                    keyboard_tap(act.get("kbd") or {})
+                else:
+                    mouse_click(act.get("mouse_button", "left"), hold)
+            except Exception:
+                pass
+            done += 1
+            if w.tick():          # 达到整组总次数上限
+                break
+            if repeat and done >= repeat:
+                break
+            delay = interval / 1000.0
+            if jitter:
+                delay += random.uniform(-jitter, jitter) / 1000.0
+            if delay < 0.001:
+                delay = 0.001
+            if w.stop_event.wait(delay):
+                break
+
+
 class ClickWorker(threading.Thread):
+    """一个绑定: 按下热键后, 该绑定下的所有动作同时开始、各自并行重复。"""
+
     def __init__(self, binding, on_stop=None):
         threading.Thread.__init__(self)
         self.daemon = True
@@ -591,63 +669,41 @@ class ClickWorker(threading.Thread):
         self.on_stop = on_stop
         self.stop_event = threading.Event()
         self.count = 0
+        self._count_lock = threading.Lock()
+        self._total = max(0, int(binding.get("repeat", 0)))
+        self._runners = []
+
+    def tick(self):
+        """计数 + 检查总次数上限; 返回 True 表示应停止。"""
+        with self._count_lock:
+            self.count += 1
+            if self._total and self.count >= self._total:
+                self.stop_event.set()
+                return True
+        return False
 
     def run(self):
         b = self.binding
-        total = max(0, int(b.get("repeat", 0)))       # 整组总次数上限, 0=无限
-        loop = bool(b.get("loop", True))              # 一轮跑完是否循环
-        if not (b.get("actions") or []):
-            if self.on_stop:
-                try:
-                    self.on_stop(b["id"])
-                except Exception:
-                    pass
+        acts = b.get("actions") or []
+        if not acts:
+            self._fire_stop()
             return
-        while not self.stop_event.is_set():
-            finished = False
-            for act in (b.get("actions") or []):
-                if self.stop_event.is_set():
-                    finished = True
-                    break
-                if not self._run_step(act, total):
-                    # 本步返回 False: 收到停止信号, 或已达到总次数上限
-                    finished = True
-                    break
-            if finished or not loop:
-                break
+        self._runners = [ActionRunner(a, i, self) for i, a in enumerate(acts)]
+        for r in self._runners:
+            r.start()
+        for r in self._runners:
+            try:
+                r.join()
+            except Exception:
+                pass
+        self._fire_stop()
+
+    def _fire_stop(self):
         if self.on_stop:
             try:
-                self.on_stop(b["id"])
+                self.on_stop(self.binding["id"])
             except Exception:
                 pass
-
-    def _run_step(self, act, total):
-        """执行序列中的一步; 返回 False 表示本轮应结束。"""
-        step_repeat = max(0, int(act.get("repeat", 0)))   # 0=本步无限
-        interval = max(1, int(act.get("interval_ms", 100)))
-        jitter = max(0, int(act.get("jitter_ms", 0)))
-        hold = max(0, int(act.get("hold_ms", 0)))
-        done = 0
-        while (step_repeat == 0 or done < step_repeat) and not self.stop_event.is_set():
-            try:
-                if act.get("type") == "keyboard":
-                    keyboard_tap(act.get("kbd") or {})
-                else:
-                    mouse_click(act.get("mouse_button", "left"), hold)
-            except Exception:
-                pass
-            self.count += 1
-            done += 1
-            if total and self.count >= total:
-                return False
-            delay = interval / 1000.0
-            if jitter:
-                delay += random.uniform(-jitter, jitter) / 1000.0
-            if delay < 0.001:
-                delay = 0.001
-            if self.stop_event.wait(delay):
-                return False
-        return not self.stop_event.is_set()
 
     def stop(self):
         self.stop_event.set()
@@ -921,11 +977,142 @@ def make_ico(path):
 import tkinter as tk  # noqa: E402
 from tkinter import ttk, messagebox  # noqa: E402
 
-BG = "#f4f6f9"
-CARD = "#ffffff"
-TEXT = "#1f2937"
-MUTED = "#6b7280"
-ACCENT = "#2563eb"
+# ---------------------------------------------------------------------------
+# 主题配色(亮 / 暗)
+# ---------------------------------------------------------------------------
+THEMES = {
+    "light": {
+        "BG": "#f4f6f9", "CARD": "#ffffff", "TEXT": "#1f2937", "MUTED": "#6b7280",
+        "ACCENT": "#2563eb", "DANGER": "#dc2626", "HEAD": "#e5e7eb", "SEL": "#dbeafe",
+        "FIELD": "#ffffff", "BORDER": "#d1d5db",
+    },
+    "dark": {
+        "BG": "#1b1e24", "CARD": "#252a32", "TEXT": "#e6e9ef", "MUTED": "#98a1b0",
+        "ACCENT": "#5b93ff", "DANGER": "#ef4444", "HEAD": "#31363f", "SEL": "#33415c",
+        "FIELD": "#2b3038", "BORDER": "#3c4453",
+    },
+}
+
+# 当前生效的颜色(切换主题时会被整体替换)
+_c = THEMES["light"]
+BG = _c["BG"]
+CARD = _c["CARD"]
+TEXT = _c["TEXT"]
+MUTED = _c["MUTED"]
+ACCENT = _c["ACCENT"]
+DANGER = _c["DANGER"]
+HEAD = _c["HEAD"]
+SEL = _c["SEL"]
+FIELD = _c["FIELD"]
+BORDER = _c["BORDER"]
+CURRENT_THEME = "light"
+
+
+def _hex_rgb(h):
+    h = (h or "#000000").lstrip("#")
+    if len(h) != 6:
+        h = "000000"
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _rgb_hex(rgb):
+    return "#%02x%02x%02x" % tuple(max(0, min(255, int(v))) for v in rgb)
+
+
+def _mix_hex(c1, c2, ratio=0.5):
+    """把 c1 按 ratio 混入 c2(结果偏 c2)。"""
+    a, b = _hex_rgb(c1), _hex_rgb(c2)
+    return _rgb_hex(tuple(a[i] * ratio + b[i] * (1 - ratio) for i in range(3)))
+
+
+def set_theme(name):
+    """切换主题: 更新模块级颜色变量, 已创建的控件由 apply_theme() 刷新。"""
+    global _c, BG, CARD, TEXT, MUTED, ACCENT, DANGER, HEAD, SEL, FIELD, BORDER, CURRENT_THEME
+    _c = THEMES.get(name, THEMES["light"])
+    BG = _c["BG"]
+    CARD = _c["CARD"]
+    TEXT = _c["TEXT"]
+    MUTED = _c["MUTED"]
+    ACCENT = _c["ACCENT"]
+    DANGER = _c["DANGER"]
+    HEAD = _c["HEAD"]
+    SEL = _c["SEL"]
+    FIELD = _c["FIELD"]
+    BORDER = _c["BORDER"]
+    CURRENT_THEME = name if name in THEMES else "light"
+    return CURRENT_THEME
+
+
+def apply_theme(root):
+    """把当前主题应用到 ttk 样式与已存在的窗口。"""
+    st = ttk.Style()
+    try:
+        st.theme_use("clam")
+    except Exception:
+        pass
+    st.configure(".", background=BG, foreground=TEXT, font=("Microsoft YaHei UI", 9),
+                 fieldbackground=FIELD, troughcolor=BG, bordercolor=BORDER)
+    st.configure("TFrame", background=BG)
+    st.configure("TLabel", background=BG, foreground=TEXT)
+    st.configure("Card.TFrame", background=CARD, relief="flat")
+    st.configure("TLabelframe", background=BG, bordercolor=BORDER)
+    st.configure("TLabelframe.Label", background=BG, foreground=TEXT)
+    st.configure("TButton", padding=(10, 6), background=CARD, foreground=TEXT,
+                 bordercolor=BORDER, lightcolor=CARD, darkcolor=CARD)
+    st.map("TButton", background=[("active", HEAD), ("disabled", BG)],
+           foreground=[("disabled", MUTED)])
+    st.configure("Accent.TButton", background=ACCENT, foreground="#ffffff",
+                 borderwidth=0, padding=(12, 6))
+    st.map("Accent.TButton", background=[("active", ACCENT)])
+    st.configure("Danger.TButton", background=DANGER, foreground="#ffffff",
+                 borderwidth=0, padding=(14, 8))
+    st.map("Danger.TButton", background=[("active", DANGER)])
+    st.configure("TCheckbutton", background=BG, foreground=TEXT, indicatorcolor=FIELD)
+    st.map("TCheckbutton", background=[("active", BG)],
+           indicatorcolor=[("selected", ACCENT)])
+    st.configure("TRadiobutton", background=BG, foreground=TEXT, indicatorcolor=FIELD)
+    st.map("TRadiobutton", background=[("active", BG)],
+           indicatorcolor=[("selected", ACCENT)])
+    st.configure("TEntry", fieldbackground=FIELD, foreground=TEXT,
+                 bordercolor=BORDER, insertcolor=TEXT)
+    st.configure("TSpinbox", fieldbackground=FIELD, foreground=TEXT,
+                 bordercolor=BORDER, background=FIELD, arrowcolor=TEXT)
+    st.configure("TCombobox", fieldbackground=FIELD, foreground=TEXT,
+                 background=FIELD, bordercolor=BORDER, arrowcolor=TEXT)
+    st.configure("TNotebook", background=BG, bordercolor=BORDER)
+    st.configure("TNotebook.Tab", background=HEAD, foreground=TEXT, padding=(12, 6))
+    st.map("TNotebook.Tab", background=[("selected", CARD)])
+    st.configure("TSeparator", background=BORDER)
+    st.configure("TScrollbar", background=BG, troughcolor=BG, bordercolor=BORDER,
+                 arrowcolor=TEXT)
+    st.configure("Treeview", background=CARD, fieldbackground=CARD,
+                 foreground=TEXT, rowheight=28, borderwidth=0, bordercolor=BORDER)
+    st.configure("Treeview.Heading", background=HEAD, foreground=TEXT,
+                 font=("Microsoft YaHei UI", 9, "bold"), bordercolor=BORDER)
+    st.map("Treeview", background=[("selected", SEL)], foreground=[("selected", TEXT)])
+
+    # 下拉框弹出的列表(不属于 ttk 样式, 要用 option 数据库)
+    try:
+        root.option_add("*TCombobox*Listbox.background", FIELD)
+        root.option_add("*TCombobox*Listbox.foreground", TEXT)
+        root.option_add("*TCombobox*Listbox.selectBackground", SEL)
+        root.option_add("*TCombobox*Listbox.selectForeground", TEXT)
+    except Exception:
+        pass
+
+    def paint(w):
+        try:
+            if isinstance(w, tk.Toplevel) or isinstance(w, tk.Tk):
+                w.configure(bg=BG)
+        except Exception:
+            pass
+
+    try:
+        paint(root)
+        for w in root.winfo_children():
+            paint(w)
+    except Exception:
+        pass
 
 UI_QUEUE = queue.Queue()
 
@@ -1020,7 +1207,7 @@ class RecordDialog(object):
 
 
 class ActionDialog(object):
-    """编辑动作序列中的一步(一次点击 / 一次按键)。"""
+    """编辑一个点击动作(一次点击 / 一次按键)。"""
 
     def __init__(self, parent, action, title="编辑动作"):
         self.action = json.loads(json.dumps(action)) if action else default_action()
@@ -1066,13 +1253,13 @@ class ActionDialog(object):
         for label, var in (("执行后等待(毫秒)", self.interval_var),
                            ("随机波动 ±(毫秒)", self.jitter_var),
                            ("按下保持(毫秒)", self.hold_var),
-                           ("连续次数(0=不限)", self.repeat_var)):
+                           ("重复次数(0=不限)", self.repeat_var)):
             ttk.Label(frm, text=label).grid(row=row, column=0, sticky="w", pady=5)
             ttk.Spinbox(frm, from_=0, to=86400000, textvariable=var, width=12).grid(
                 row=row, column=1, sticky="w", pady=5)
             row += 1
 
-        ttk.Label(frm, text="「连续次数」= 本步连续做几次再进入下一步，0 表示一直重复本步。",
+        ttk.Label(frm, text="「重复次数」= 这个动作点几下；0 = 一直点到停止为止。",
                   foreground=MUTED).grid(row=row, column=0, columnspan=3, sticky="w", pady=(10, 2))
         row += 1
 
@@ -1134,7 +1321,7 @@ class ActionDialog(object):
 
 
 class BindingDialog(object):
-    """新增 / 编辑绑定: 一个热键 + 一组按顺序执行的动作序列。"""
+    """新增 / 编辑绑定: 一个热键 + 一组同时启动的点击动作。"""
 
     def __init__(self, parent, binding, existing):
         self.binding = json.loads(json.dumps(binding))  # 副本
@@ -1155,7 +1342,6 @@ class BindingDialog(object):
 
         self.name_var = tk.StringVar(value=self.binding.get("name", ""))
         self.enabled_var = tk.BooleanVar(value=bool(self.binding.get("enabled", True)))
-        self.loop_var = tk.BooleanVar(value=bool(self.binding.get("loop", True)))
         self.repeat_var = tk.StringVar(value=str(self.binding.get("repeat", 0)))
         self.hk_var = tk.StringVar(value=fmt_combo(self.binding.get("hotkey")))
 
@@ -1175,10 +1361,10 @@ class BindingDialog(object):
         ttk.Button(frm, text="录制…", command=self._record_hotkey, width=8).grid(row=row, column=2, padx=6)
         row += 1
 
-        # ---- 动作序列 ----
+        # ---- 动作列表 ----
         ttk.Separator(frm, orient="horizontal").grid(row=row, column=0, columnspan=4, sticky="ew", pady=(12, 8))
         row += 1
-        ttk.Label(frm, text="动作序列（一个热键可依次执行多种点击）").grid(
+        ttk.Label(frm, text="点击动作（按下热键后这些动作同时开始，各自按自己的节奏重复）").grid(
             row=row, column=0, columnspan=4, sticky="w", pady=(0, 6))
         row += 1
 
@@ -1186,7 +1372,7 @@ class BindingDialog(object):
         box.grid(row=row, column=0, columnspan=4, sticky="ew")
         cols = ("no", "action", "rhythm", "times")
         self.act_tree = ttk.Treeview(box, columns=cols, show="headings", height=4, selectmode="browse")
-        heads = {"no": "#", "action": "动作", "rhythm": "节奏", "times": "连续次数"}
+        heads = {"no": "#", "action": "动作", "rhythm": "节奏", "times": "重复次数"}
         widths = {"no": 34, "action": 150, "rhythm": 130, "times": 80}
         for c in cols:
             self.act_tree.heading(c, text=heads[c])
@@ -1206,11 +1392,7 @@ class BindingDialog(object):
             ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=(0, 6))
         row += 1
 
-        ttk.Checkbutton(frm, text="循环执行序列（取消勾选则跑完一轮自动停止）",
-                        variable=self.loop_var).grid(row=row, column=1, columnspan=3, sticky="w", pady=(10, 4))
-        row += 1
-
-        ttk.Label(frm, text="总执行次数(0=无限)").grid(row=row, column=0, sticky="w", pady=5)
+        ttk.Label(frm, text="总点击次数(0=无限)").grid(row=row, column=0, sticky="w", pady=(10, 5))
         ttk.Spinbox(frm, from_=0, to=86400000, textvariable=self.repeat_var, width=12).grid(
             row=row, column=1, sticky="w", pady=5)
         row += 1
@@ -1218,7 +1400,7 @@ class BindingDialog(object):
         ttk.Label(frm, text="点击位置始终为鼠标光标当前所在位置(不移动、不锁定光标)。",
                   foreground=MUTED).grid(row=row, column=0, columnspan=4, sticky="w", pady=(10, 2))
         row += 1
-        ttk.Label(frm, text="热键为「开关」: 按一次开始，再按一次停止；双击上表行可编辑该步。",
+        ttk.Label(frm, text="热键为「开关」: 按一次开始，再按一次停止；双击上表行可编辑该动作。",
                   foreground=MUTED).grid(row=row, column=0, columnspan=4, sticky="w")
         row += 1
 
@@ -1236,7 +1418,7 @@ class BindingDialog(object):
             pass
         parent.wait_window(self.top)
 
-    # ---- 动作序列 ----
+    # ---- 动作列表 ----
     def _refresh_actions(self):
         t = self.act_tree
         for iid in list(t.get_children()):
@@ -1340,7 +1522,7 @@ class BindingDialog(object):
             return
         self.binding["name"] = name
         self.binding["enabled"] = bool(self.enabled_var.get())
-        self.binding["loop"] = bool(self.loop_var.get())
+        self.binding["loop"] = True
         self.binding["repeat"] = max(0, total)
         self.binding["actions"] = acts
         self.ok = True
@@ -1353,59 +1535,354 @@ class BindingDialog(object):
         self.top.destroy()
 
 
+def exe_command():
+    """开机启动注册表里写的命令行。"""
+    try:
+        if getattr(sys, "frozen", False):
+            return '"%s"' % os.path.abspath(sys.executable)
+        py = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "pythonw.exe")
+        if not os.path.isfile(py):
+            py = os.path.abspath(sys.executable)
+        return '"%s" "%s"' % (py, os.path.abspath(__file__))
+    except Exception:
+        return ""
+
+
+def autostart_get():
+    """读取开机启动项命令行, 未启用返回空串。"""
+    try:
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, winreg.KEY_READ)
+        try:
+            v, _ = winreg.QueryValueEx(k, APP_NAME)
+        finally:
+            winreg.CloseKey(k)
+        return str(v)
+    except Exception:
+        return ""
+
+
+def autostart_set(on, hidden=False):
+    """开关开机启动; 返回是否成功。"""
+    try:
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, winreg.KEY_SET_VALUE)
+        try:
+            if on:
+                cmd = exe_command()
+                if hidden:
+                    cmd += " --hidden"
+                winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, cmd)
+            else:
+                try:
+                    winreg.DeleteValue(k, APP_NAME)
+                except Exception:
+                    pass
+        finally:
+            winreg.CloseKey(k)
+        return True
+    except Exception:
+        return False
+
+
+def list_pictures():
+    """AClib/pictures 下的图片文件名(按名称排序)。"""
+    try:
+        os.makedirs(PICTURES_DIR, exist_ok=True)
+        names = [n for n in os.listdir(PICTURES_DIR)
+                 if n.lower().endswith(IMAGE_EXTS) and os.path.isfile(os.path.join(PICTURES_DIR, n))]
+        return sorted(names, key=lambda s: s.lower())
+    except Exception:
+        return []
+
+
+def import_picture(src):
+    """把外部图片复制进 AClib/pictures, 返回文件名。"""
+    try:
+        os.makedirs(PICTURES_DIR, exist_ok=True)
+        name = os.path.basename(src)
+        dst = os.path.join(PICTURES_DIR, name)
+        if os.path.abspath(src) != os.path.abspath(dst):
+            base, ext = os.path.splitext(name)
+            i = 1
+            while os.path.exists(dst):
+                dst = os.path.join(PICTURES_DIR, "%s_%d%s" % (base, i, ext))
+                i += 1
+            shutil.copy2(src, dst)
+        return os.path.basename(dst)
+    except Exception:
+        return ""
+
+
+class AboutDialog(object):
+    """关于: 版权 / 作者 / 开源地址。"""
+
+    def __init__(self, parent):
+        self.top = tk.Toplevel(parent)
+        self.top.title("关于 %s" % APP_NAME)
+        self.top.configure(bg=BG)
+        self.top.transient(parent)
+        self.top.resizable(False, False)
+        self.top.grab_set()
+
+        frm = ttk.Frame(self.top, padding=20)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(frm, text="%s  v%s" % (APP_NAME, APP_VERSION),
+                  font=("Microsoft YaHei UI", 14, "bold")).pack(anchor="w")
+        ttk.Label(frm, text="由 %s 制作   ·   © %s" % (AUTHOR, time.strftime("%Y")),
+                  foreground=MUTED).pack(anchor="w", pady=(4, 12))
+
+        ttk.Separator(frm, orient="horizontal").pack(fill="x", pady=(0, 12))
+
+        ttk.Label(frm, text="开源地址（点击在浏览器中打开）").pack(anchor="w")
+        link = tk.Label(frm, text=PROJECT_URL, fg=ACCENT, bg=BG, cursor="hand2",
+                        font=("Microsoft YaHei UI", 9, "underline"))
+        link.pack(anchor="w", pady=(2, 10))
+        link.bind("<Button-1>", lambda e: self._open())
+
+        ttk.Label(frm, text="许可协议: MIT License（可自由使用、修改、分发，需保留版权声明）",
+                  foreground=MUTED, wraplength=380, justify="left").pack(anchor="w")
+        ttk.Label(frm, text="本程序使用 Python + Win32 SendInput 编写，源码完全公开。",
+                  foreground=MUTED, wraplength=380, justify="left").pack(anchor="w", pady=(6, 12))
+
+        bar = ttk.Frame(frm)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="打开项目主页", command=self._open).pack(side="left")
+        ttk.Button(bar, text="复制网址", command=self._copy).pack(side="left", padx=(8, 0))
+        ttk.Button(bar, text="关闭", command=self._close).pack(side="right")
+
+        self.top.update_idletasks()
+        try:
+            self.top.geometry("+%d+%d" % (parent.winfo_rootx() + 120, parent.winfo_rooty() + 80))
+        except Exception:
+            pass
+        parent.wait_window(self.top)
+
+    def _open(self):
+        try:
+            webbrowser.open(PROJECT_URL)
+        except Exception:
+            pass
+
+    def _copy(self):
+        try:
+            self.top.clipboard_clear()
+            self.top.clipboard_append(PROJECT_URL)
+        except Exception:
+            pass
+
+    def _close(self):
+        self.top.grab_release()
+        self.top.destroy()
+
+
 class SettingsDialog(object):
-    def __init__(self, parent, config):
+    """设置: 常规 / 外观 / 关于。"""
+
+    def __init__(self, parent, config, app=None):
         self.config = config
+        self.app = app
         self.ok = False
+        self._old_theme = config.settings.get("theme", "light")
         self.top = tk.Toplevel(parent)
         self.top.title("设置")
         self.top.configure(bg=BG)
         self.top.transient(parent)
         self.top.resizable(False, False)
         self.top.grab_set()
-
-        frm = ttk.Frame(self.top, padding=16)
-        frm.pack(fill="both", expand=True)
+        self.top.protocol("WM_DELETE_WINDOW", self._close)
 
         st = config.settings
         self.em_var = tk.StringVar(value=fmt_combo(st.get("emergency_hotkey")))
         self.fallback_var = tk.BooleanVar(value=bool(st.get("panic_fallback", True)))
-        self.tray_var = tk.BooleanVar(value=bool(st.get("close_to_tray", True)))
-        self.hidden_var = tk.BooleanVar(value=bool(st.get("start_hidden", False)))
-
-        ttk.Label(frm, text="全局设置", font=("Microsoft YaHei UI", 11, "bold")).grid(
-            row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
-
-        ttk.Label(frm, text="紧急停止热键").grid(row=1, column=0, sticky="w", pady=6)
-        ttk.Entry(frm, textvariable=self.em_var, width=22, state="readonly").grid(row=1, column=1, sticky="ew", pady=6)
-        ttk.Button(frm, text="录制…", width=8, command=self._record).grid(row=1, column=2, padx=6)
-
+        self.close_var = tk.StringVar(value=st.get("close_action", "tray"))
+        self.auto_var = tk.BooleanVar(value=bool(st.get("autostart", False)))
+        self.auto_hidden_var = tk.BooleanVar(value=bool(st.get("start_hidden", False)))
+        self.theme_var = tk.StringVar(value=st.get("theme", "light"))
+        self.bg_var = tk.StringVar(value=(st.get("background") or ""))
         self.new_em = st.get("emergency_hotkey")
 
-        ttk.Checkbutton(frm, text="始终保留 Ctrl+Alt+F12 作为备用急停热键",
-                        variable=self.fallback_var).grid(row=2, column=0, columnspan=3, sticky="w", pady=4)
-        ttk.Checkbutton(frm, text="关闭窗口时最小化到系统托盘(不退出程序)",
-                        variable=self.tray_var).grid(row=3, column=0, columnspan=3, sticky="w", pady=4)
-        ttk.Checkbutton(frm, text="程序启动时隐藏主界面(仅托盘)",
-                        variable=self.hidden_var).grid(row=4, column=0, columnspan=3, sticky="w", pady=4)
+        nb = ttk.Notebook(self.top)
+        nb.pack(fill="both", expand=True, padx=14, pady=14)
 
-        ttk.Label(frm, text="配置文件: %s" % CONFIG_FILE, foreground=MUTED).grid(
-            row=5, column=0, columnspan=3, sticky="w", pady=(14, 2))
-        ttk.Button(frm, text="打开配置目录", command=self._open_dir).grid(
-            row=6, column=0, columnspan=3, sticky="w", pady=(2, 10))
+        f1 = ttk.Frame(nb, padding=16)
+        f2 = ttk.Frame(nb, padding=16)
+        f3 = ttk.Frame(nb, padding=16)
+        nb.add(f1, text="常规")
+        nb.add(f2, text="外观")
+        nb.add(f3, text="关于")
 
-        bar = ttk.Frame(frm)
-        bar.grid(row=7, column=0, columnspan=3, sticky="e")
+        # ---------------- 常规 ----------------
+        row = 0
+        ttk.Label(f1, text="紧急停止热键").grid(row=row, column=0, sticky="w", pady=6)
+        ttk.Entry(f1, textvariable=self.em_var, width=22, state="readonly").grid(row=row, column=1, sticky="ew", pady=6)
+        ttk.Button(f1, text="录制…", width=8, command=self._record).grid(row=row, column=2, padx=6)
+        row += 1
+
+        ttk.Checkbutton(f1, text="始终保留 Ctrl+Alt+F12 作为备用急停热键",
+                        variable=self.fallback_var).grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
+        row += 1
+
+        ttk.Separator(f1, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=10)
+        row += 1
+
+        ttk.Label(f1, text="关闭窗口时").grid(row=row, column=0, sticky="w", pady=4)
+        box = ttk.Frame(f1)
+        box.grid(row=row, column=1, columnspan=2, sticky="w")
+        ttk.Radiobutton(box, text="最小化到系统托盘(继续后台响应热键)", value="tray",
+                        variable=self.close_var).pack(anchor="w")
+        ttk.Radiobutton(box, text="直接退出程序", value="quit",
+                        variable=self.close_var).pack(anchor="w", pady=(2, 0))
+        row += 1
+
+        ttk.Separator(f1, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=10)
+        row += 1
+
+        cur = autostart_get()
+        self.auto_state = tk.StringVar(
+            value=("开机启动: 已启用" if cur else "开机启动: 未启用"))
+        ttk.Checkbutton(f1, text="开机自动启动", variable=self.auto_var).grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=4)
+        row += 1
+        ttk.Checkbutton(f1, text="开机启动后不显示主界面(仅托盘)",
+                        variable=self.auto_hidden_var).grid(
+            row=row, column=1, columnspan=2, sticky="w", pady=2)
+        row += 1
+        ttk.Label(f1, textvariable=self.auto_state, foreground=MUTED).grid(
+            row=row, column=1, columnspan=2, sticky="w", pady=2)
+        row += 1
+
+        ttk.Label(f1, text="配置文件: %s" % CONFIG_FILE, foreground=MUTED,
+                  wraplength=380, justify="left").grid(row=row, column=0, columnspan=3, sticky="w", pady=(12, 2))
+        row += 1
+        ttk.Button(f1, text="打开配置目录", command=self._open_dir).grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(2, 4))
+        row += 1
+        f1.columnconfigure(1, weight=1)
+
+        # ---------------- 外观 ----------------
+        row = 0
+        ttk.Label(f2, text="界面主题").grid(row=row, column=0, sticky="w", pady=(0, 6))
+        box2 = ttk.Frame(f2)
+        box2.grid(row=row, column=1, columnspan=2, sticky="w")
+        ttk.Radiobutton(box2, text="亮色", value="light", variable=self.theme_var,
+                        command=self._preview_theme).pack(side="left")
+        ttk.Radiobutton(box2, text="暗色", value="dark", variable=self.theme_var,
+                        command=self._preview_theme).pack(side="left", padx=(16, 0))
+        row += 1
+
+        ttk.Separator(f2, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=12)
+        row += 1
+
+        ttk.Label(f2, text="界面背景图").grid(row=row, column=0, sticky="w", pady=6)
+        self.bg_combo = ttk.Combobox(f2, textvariable=self.bg_var, width=26, state="readonly")
+        self.bg_combo.grid(row=row, column=1, sticky="ew", pady=6)
+        self.bg_combo.bind("<<ComboboxSelected>>", lambda e: self._preview_bg())
+        ttk.Button(f2, text="浏览…", width=8, command=self._browse_bg).grid(row=row, column=2, padx=6)
+        row += 1
+        self._fill_pictures()
+
+        ttk.Button(f2, text="不使用背景图", command=self._clear_bg).grid(
+            row=row, column=1, sticky="w", pady=(2, 8))
+        row += 1
+
+        ttk.Label(f2, text="图片请放在配置目录下的 pictures 文件夹：\n%s" % PICTURES_DIR,
+                  foreground=MUTED, wraplength=400, justify="left").grid(
+            row=row, column=0, columnspan=3, sticky="w")
+        row += 1
+        ttk.Label(f2, text="选「浏览…」会自动把图片复制进该目录。图片按比例铺满窗口。",
+                  foreground=MUTED, wraplength=400, justify="left").grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        row += 1
+        f2.columnconfigure(1, weight=1)
+
+        # ---------------- 关于 ----------------
+        ttk.Label(f3, text="%s  v%s" % (APP_NAME, APP_VERSION),
+                  font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="w")
+        ttk.Label(f3, text="由 %s 制作   ·   © %s" % (AUTHOR, time.strftime("%Y")),
+                  foreground=MUTED).pack(anchor="w", pady=(2, 10))
+        link = tk.Label(f3, text=PROJECT_URL, fg=ACCENT, bg=BG, cursor="hand2",
+                        font=("Microsoft YaHei UI", 9, "underline"))
+        link.pack(anchor="w")
+        link.bind("<Button-1>", lambda e: self._open_url())
+        ttk.Label(f3, text="许可协议: MIT License", foreground=MUTED).pack(anchor="w", pady=(6, 10))
+        bar3 = ttk.Frame(f3)
+        bar3.pack(fill="x")
+        ttk.Button(bar3, text="打开项目主页", command=self._open_url).pack(side="left")
+        ttk.Button(bar3, text="复制网址", command=self._copy_url).pack(side="left", padx=(8, 0))
+        ttk.Button(bar3, text="关于窗口", command=self._open_about).pack(side="left", padx=(8, 0))
+
+        # ---------------- 底部 ----------------
+        bar = ttk.Frame(self.top)
+        bar.pack(fill="x", padx=14, pady=(0, 14))
         ttk.Button(bar, text="取消", command=self._close).pack(side="right")
         ttk.Button(bar, text="保存", command=self._save, style="Accent.TButton").pack(side="right", padx=(0, 8))
 
-        frm.columnconfigure(1, weight=1)
         self.top.update_idletasks()
         try:
-            self.top.geometry("+%d+%d" % (parent.winfo_rootx() + 80, parent.winfo_rooty() + 60))
+            self.top.geometry("+%d+%d" % (parent.winfo_rootx() + 60, parent.winfo_rooty() + 40))
         except Exception:
             pass
         parent.wait_window(self.top)
+
+    # ---- 外观 ----
+    def _fill_pictures(self):
+        names = [""] + list_pictures()
+        self.bg_combo["values"] = names
+        cur = (self.bg_var.get() or "").strip()
+        if cur not in names:
+            cur = ""
+        self.bg_var.set(cur)
+
+    def _preview_theme(self):
+        if self.app:
+            try:
+                self.app.preview_theme(self.theme_var.get())
+            except Exception:
+                pass
+
+    def _preview_bg(self):
+        if self.app:
+            try:
+                self.app.preview_background(self.bg_var.get())
+            except Exception:
+                pass
+
+    def _browse_bg(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            parent=self.top, title="选择背景图片",
+            filetypes=[("图片文件", "*.png *.jpg *.jpeg *.bmp *.gif"), ("所有文件", "*.*")])
+        if not path:
+            return
+        name = import_picture(path)
+        if not name:
+            messagebox.showwarning("导入失败", "无法把图片复制到 pictures 目录。", parent=self.top)
+            return
+        self._fill_pictures()
+        self.bg_var.set(name)
+        self._preview_bg()
+
+    def _clear_bg(self):
+        self.bg_var.set("")
+        self._preview_bg()
+
+    def _open_about(self):
+        AboutDialog(self.top)
+
+    def _open_url(self):
+        try:
+            webbrowser.open(PROJECT_URL)
+        except Exception:
+            pass
+
+    def _copy_url(self):
+        try:
+            self.top.clipboard_clear()
+            self.top.clipboard_append(PROJECT_URL)
+        except Exception:
+            pass
 
     def _record(self):
         dlg = RecordDialog(self.top, "录制紧急停止热键", self.new_em, allow_single=False)
@@ -1421,15 +1898,33 @@ class SettingsDialog(object):
             pass
 
     def _save(self):
-        self.config.settings["emergency_hotkey"] = self.new_em
-        self.config.settings["panic_fallback"] = bool(self.fallback_var.get())
-        self.config.settings["close_to_tray"] = bool(self.tray_var.get())
-        self.config.settings["start_hidden"] = bool(self.hidden_var.get())
+        s = self.config.settings
+        s["emergency_hotkey"] = self.new_em
+        s["panic_fallback"] = bool(self.fallback_var.get())
+        s["close_action"] = self.close_var.get()
+        s["start_hidden"] = bool(self.auto_hidden_var.get())
+        s["theme"] = self.theme_var.get()
+        s["background"] = (self.bg_var.get() or "").strip()
+        s["autostart"] = bool(self.auto_var.get())
+        autostart_set(s["autostart"], hidden=s["start_hidden"])
         self.config.save()
         self.ok = True
+        if self.app:
+            try:
+                self.app.apply_settings()
+                self.app.rebuild_after_settings()
+            except Exception:
+                pass
         self._close()
 
     def _close(self):
+        if not self.ok and self.app:
+            # 取消: 还原预览过的主题/背景
+            try:
+                self.app.preview_theme(self._old_theme)
+                self.app.preview_background(self.config.settings.get("background", ""))
+            except Exception:
+                pass
         self.top.grab_release()
         self.top.destroy()
 
@@ -1450,7 +1945,13 @@ class App(object):
         self.root.minsize(760, 460)
         self.root.configure(bg=BG)
 
+        set_theme(config.settings.get("theme", "light"))
+        try:
+            os.makedirs(PICTURES_DIR, exist_ok=True)
+        except Exception:
+            pass
         self._style()
+        self._setup_background()
         self._build()
         self._refresh_tree()
 
@@ -1460,45 +1961,138 @@ class App(object):
         self._setup_tray()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.after(400, self._refresh_background)
         self._poll()
 
     # ---- 样式 ----
     def _style(self):
-        st = ttk.Style()
+        apply_theme(self.root)
+
+    # ---- 界面背景图 ----
+    def _setup_background(self):
+        """底层 Canvas 铺背景图(图片来自 AClib/pictures)。"""
+        self._bg_photo = None
+        self._bg_item = None
+        self._bg_margin = 0
+        self.bg_canvas = tk.Canvas(self.root, highlightthickness=0, bd=0,
+                                   bg=BG)
+        self.bg_canvas.place(x=0, y=0, relwidth=1, relheight=1)
         try:
-            st.theme_use("clam")
+            self.bg_canvas.lower()
         except Exception:
             pass
-        st.configure(".", background=BG, foreground=TEXT, font=("Microsoft YaHei UI", 9))
-        st.configure("TFrame", background=BG)
-        st.configure("TLabel", background=BG, foreground=TEXT)
-        st.configure("Card.TFrame", background=CARD, relief="flat")
-        st.configure("TButton", padding=(10, 6))
-        st.configure("Accent.TButton", background=ACCENT, foreground="#ffffff",
-                     borderwidth=0, padding=(12, 6))
-        st.map("Accent.TButton", background=[("active", "#1d4ed8")])
-        st.configure("Danger.TButton", background="#dc2626", foreground="#ffffff",
-                     borderwidth=0, padding=(14, 8))
-        st.map("Danger.TButton", background=[("active", "#b91c1c")])
-        st.configure("Treeview", background=CARD, fieldbackground=CARD,
-                     foreground=TEXT, rowheight=28, borderwidth=0)
-        st.configure("Treeview.Heading", background="#e5e7eb", foreground=TEXT,
-                     font=("Microsoft YaHei UI", 9, "bold"))
-        st.map("Treeview", background=[("selected", "#dbeafe")],
+        self._resize_job = None
+        self.root.bind("<Configure>", self._on_resize)
+        self._refresh_background()
+
+    def _layout_outer(self):
+        """内容面板四周留 18px, 背景图才看得见。"""
+        try:
+            w = self.root.winfo_width()
+            h = self.root.winfo_height()
+            if w <= 1 or h <= 1:
+                return
+            m = getattr(self, "_bg_margin", 0)
+            self.outer.place(x=m, y=m, width=max(40, w - 2 * m), height=max(40, h - 2 * m))
+        except Exception:
+            pass
+
+    def _on_resize(self, event=None):
+        self._layout_outer()
+        if self._resize_job:
+            try:
+                self.root.after_cancel(self._resize_job)
+            except Exception:
+                pass
+        self._resize_job = self.root.after(150, self._refresh_background)
+
+    def _reset_glass(self):
+        """无背景图时, 玻璃面板回到普通主题色。"""
+        st = ttk.Style()
+        st.configure("Glass.TFrame", background=BG)
+        st.configure("Glass.TLabel", background=BG, foreground=TEXT)
+        st.configure("Glass.Treeview", background=CARD, fieldbackground=CARD,
+                     foreground=TEXT, rowheight=28, borderwidth=0, bordercolor=BORDER)
+        st.configure("Glass.Treeview.Heading", background=HEAD, foreground=TEXT,
+                     font=("Microsoft YaHei UI", 9, "bold"), bordercolor=BORDER)
+        st.map("Glass.Treeview", background=[("selected", SEL)],
                foreground=[("selected", TEXT)])
+
+    def _refresh_background(self):
+        name = (self.config.settings.get("background") or "").strip()
+        try:
+            self.bg_canvas.delete("all")
+        except Exception:
+            return
+        path = os.path.join(PICTURES_DIR, name) if name else ""
+        if not path or not os.path.isfile(path):
+            self.bg_canvas.configure(bg=BG)
+            self._bg_photo = None
+            self._reset_glass()
+            self._bg_margin = 0
+            self._layout_outer()
+            return
+        try:
+            from PIL import Image, ImageTk
+            w = max(1, self.root.winfo_width())
+            h = max(1, self.root.winfo_height())
+            img = Image.open(path)
+            img = img.convert("RGB")
+            # cover: 按比例填满窗口
+            rw, rh = img.size
+            scale = max(w / float(rw), h / float(rh))
+            img = img.resize((max(1, int(rw * scale)), max(1, int(rh * scale))),
+                             Image.LANCZOS)
+            left = max(0, (img.size[0] - w) // 2)
+            top = max(0, (img.size[1] - h) // 2)
+            img = img.crop((left, top, left + w, top + h))
+            # 面板色 = 图片平均色与主题色混合, 让内容区也带上图片色调
+            avg = img.resize((1, 1)).getpixel((0, 0))
+            panel = _mix_hex(_rgb_hex(avg), CARD, 0.18)
+            head_col = _mix_hex(_rgb_hex(avg), HEAD, 0.18)
+            st = ttk.Style()
+            st.configure("Glass.TFrame", background=panel)
+            st.configure("Glass.TLabel", background=panel, foreground=TEXT)
+            st.configure("Glass.Treeview", background=panel, fieldbackground=panel,
+                         foreground=TEXT, rowheight=28, borderwidth=0, bordercolor=BORDER)
+            st.configure("Glass.Treeview.Heading", background=head_col, foreground=TEXT,
+                         font=("Microsoft YaHei UI", 9, "bold"), bordercolor=BORDER)
+            st.map("Glass.Treeview", background=[("selected", SEL)],
+                   foreground=[("selected", TEXT)])
+            self._bg_photo = ImageTk.PhotoImage(img)
+            self.bg_canvas.configure(bg=BG)
+            self.bg_canvas.create_image(0, 0, anchor="nw", image=self._bg_photo)
+            self._bg_margin = 18
+            self._layout_outer()
+        except Exception:
+            self.bg_canvas.configure(bg=BG)
+            self._bg_photo = None
+            self._reset_glass()
+
+    def apply_settings(self):
+        """设置保存后: 主题 / 背景 / 列表配色立即生效。"""
+        set_theme(self.config.settings.get("theme", "light"))
+        self._restyle()
 
     # ---- 界面 ----
     def _build(self):
-        head = ttk.Frame(self.root, padding=(16, 14, 16, 6))
+        # 内容面板(四周留边, 让背景图在窗口边缘露出来)
+        self.outer = ttk.Frame(self.root, style="Glass.TFrame", padding=0)
+        self._layout_outer()
+        panel = self.outer
+
+        head = ttk.Frame(panel, padding=(16, 14, 16, 6), style="Glass.TFrame")
         head.pack(fill="x")
         ttk.Label(head, text=APP_NAME, font=("Microsoft YaHei UI", 15, "bold"),
-                  foreground=TEXT).pack(side="left")
-        self.state_label = ttk.Label(head, text="就绪", foreground=MUTED)
+                  foreground=TEXT, style="Glass.TLabel").pack(side="left")
+        self.state_label = ttk.Label(head, text="就绪", foreground=MUTED,
+                                     style="Glass.TLabel")
         self.state_label.pack(side="left", padx=(14, 0))
-        ttk.Button(head, text="设置", command=self.open_settings, width=8).pack(side="right")
+        ttk.Button(head, text="关于", command=self.open_about, width=6).pack(side="right")
+        ttk.Button(head, text="设置", command=self.open_settings, width=8).pack(side="right", padx=(8, 0))
         ttk.Button(head, text="隐藏到托盘", command=self.hide_window, width=11).pack(side="right", padx=(0, 8))
 
-        bar = ttk.Frame(self.root, padding=(16, 4))
+        bar = ttk.Frame(panel, padding=(16, 4), style="Glass.TFrame")
         bar.pack(fill="x")
         ttk.Button(bar, text="＋ 新增", command=self.add_binding, style="Accent.TButton").pack(side="left")
         ttk.Button(bar, text="编辑", command=self.edit_binding, width=8).pack(side="left", padx=(8, 0))
@@ -1507,10 +2101,11 @@ class App(object):
         ttk.Button(bar, text="⏹ 紧急停止(全部)", command=self.emergency_stop,
                    style="Danger.TButton").pack(side="right")
 
-        wrap = ttk.Frame(self.root, padding=(16, 8))
+        wrap = ttk.Frame(panel, padding=(16, 8), style="Glass.TFrame")
         wrap.pack(fill="both", expand=True)
         cols = ("status", "name", "hotkey", "action", "interval", "count")
-        self.tree = ttk.Treeview(wrap, columns=cols, show="headings", selectmode="browse")
+        self.tree = ttk.Treeview(wrap, columns=cols, show="headings", selectmode="browse",
+                                 style="Glass.Treeview")
         heads = {"status": "状态", "name": "名称", "hotkey": "热键", "action": "点击动作",
                  "interval": "间隔(ms)", "count": "已点击"}
         widths = {"status": 110, "name": 120, "hotkey": 130, "action": 200,
@@ -1526,11 +2121,21 @@ class App(object):
         self.tree.tag_configure("stopped", foreground=MUTED)
         self.tree.bind("<Double-1>", lambda e: self.edit_binding())
 
-        foot = ttk.Frame(self.root, padding=(16, 6, 16, 12))
+        foot = ttk.Frame(panel, padding=(16, 6, 16, 12), style="Glass.TFrame")
         foot.pack(fill="x")
         self.tip = tk.StringVar(value="双击行可编辑；热键为开关模式(按一次开始，再按一次停止)，全局生效。")
-        ttk.Label(foot, textvariable=self.tip, foreground=MUTED).pack(side="left")
-        ttk.Label(foot, text="配置: %s" % CONFIG_FILE, foreground=MUTED).pack(side="right")
+        ttk.Label(foot, textvariable=self.tip, foreground=MUTED,
+                  style="Glass.TLabel").pack(side="left")
+        self.foot_right = ttk.Label(foot, foreground=MUTED, style="Glass.TLabel")
+        self.foot_right.pack(side="right")
+        self._update_foot()
+
+    def _update_foot(self):
+        try:
+            self.foot_right.configure(
+                text="配置: %s  ·  %s 制作" % (CONFIG_FILE, AUTHOR))
+        except Exception:
+            pass
 
     # ---- 数据同步 ----
     def _refresh_tree(self):
@@ -1629,11 +2234,47 @@ class App(object):
         self._notify("已停止全部连点", "紧急停止已执行")
 
     def open_settings(self):
-        dlg = SettingsDialog(self.root, self.config)
+        dlg = SettingsDialog(self.root, self.config, app=self)
         if dlg.ok:
             self.engine.rebuild_hotkeys()
             self._refresh_tree()
+            self._update_foot()
             self._notify("设置已保存", APP_NAME)
+
+    def open_about(self):
+        AboutDialog(self.root)
+
+    def _restyle(self):
+        """主题/背景变化后的统一刷新(样式 + 背景 + 列表标签色)。"""
+        self._style()
+        self._refresh_background()
+        try:
+            self.tree.tag_configure("running", foreground="#15803d")
+            self.tree.tag_configure("stopped", foreground=MUTED)
+        except Exception:
+            pass
+
+    def preview_theme(self, name):
+        """设置里切换主题时的即时预览。"""
+        set_theme(name)
+        self._restyle()
+
+    def preview_background(self, name):
+        """设置里切换背景图时的即时预览。"""
+        try:
+            self.config.settings["background"] = name or ""
+        except Exception:
+            pass
+        self._refresh_background()
+
+    def rebuild_after_settings(self):
+        """设置保存后需要重建的东西(热键等)。"""
+        try:
+            self.engine.rebuild_hotkeys()
+            self._refresh_tree()
+            self._update_foot()
+        except Exception:
+            pass
 
     def save_and_rebuild(self):
         self.config.save()
@@ -1655,10 +2296,10 @@ class App(object):
             pass
 
     def on_close(self):
-        if self.config.settings.get("close_to_tray", True):
-            self.hide_window()
-        else:
+        if self.config.settings.get("close_action", "tray") == "quit":
             self.quit_app()
+        else:
+            self.hide_window()
 
     def _setup_tray(self):
         try:
@@ -1689,6 +2330,8 @@ class App(object):
         for b in list(self.config.bindings):
             items.append(Item(self._menu_text_factory(b), self._menu_action_factory(b["id"])))
         items.append(Menu.SEPARATOR)
+        items.append(Item("设置…", self._tray_settings))
+        items.append(Item("关于", self._tray_about))
         items.append(Item("退出", self._tray_quit))
         return Menu(*items)
 
@@ -1713,6 +2356,14 @@ class App(object):
 
     def _tray_quit(self, icon=None, item=None):
         ui_call(self.quit_app)
+
+    def _tray_settings(self, icon=None, item=None):
+        ui_call(self.show_window)
+        ui_call(self.open_settings)
+
+    def _tray_about(self, icon=None, item=None):
+        ui_call(self.show_window)
+        ui_call(self.open_about)
 
     def _sync_tray(self):
         if not self.icon:
@@ -1810,6 +2461,17 @@ def main():
 
     config = Config()
     config.save()  # 确保配置目录 / 文件存在
+    try:
+        os.makedirs(PICTURES_DIR, exist_ok=True)
+    except Exception:
+        pass
+    # 让注册表开机启动项与配置保持一致(例如 exe 位置变过)
+    try:
+        want = bool(config.settings.get("autostart", False))
+        if want != bool(autostart_get()):
+            autostart_set(want, hidden=bool(config.settings.get("start_hidden", False)))
+    except Exception:
+        pass
     engine = Engine(config)
 
     root = tk.Tk()
@@ -1821,7 +2483,8 @@ def main():
     except Exception:
         pass
     app = App(root, config, engine)
-    if config.settings.get("start_hidden", False):
+    hidden = bool(config.settings.get("start_hidden", False)) or ("--hidden" in sys.argv[1:])
+    if hidden:
         app.hide_window()
     root.mainloop()
 

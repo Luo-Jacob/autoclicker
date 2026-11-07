@@ -42,7 +42,7 @@ except Exception:
     _pkb = None
 
 APP_NAME = "AutoClicker"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.5"
 MUTEX_NAME = "Global\\AutoClicker_SingleInstance"
 AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
@@ -90,6 +90,7 @@ PICTURES_DIR = os.path.join(CONFIG_DIR, "pictures")
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif")
 LEGACY_CONFIG_FILES = [os.path.join(base_dir(), "AutoClicker", "config.json")]
 PROJECT_URL = "https://github.com/Luo-Jacob/autoclicker"
+LATEST_URL = PROJECT_URL + "/releases/latest"   # 最新版本页面
 AUTHOR = "Luo-Jacob"
 
 MOD_CTRL, MOD_ALT, MOD_SHIFT, MOD_WIN = 0x0002, 0x0001, 0x0004, 0x0008
@@ -235,6 +236,7 @@ def default_config():
             "autostart": False,
             "theme": "light",
             "background": "",
+            "background_opacity": 45,  # 启用背景图时内容面板的遮罩不透明度(0-100, 越小越透)
             "script_enabled": False,   # 高级脚本默认关闭, 需显式开启
             "restore_cursor": True,    # 固定坐标点击后把光标移回原位
             "active_preset": 0,        # 0 = 当前工作集(不属于任何预设)
@@ -501,6 +503,7 @@ class Config(object):
             if s.get("theme") not in ("light", "dark"):
                 s["theme"] = "light"
             s["background"] = str(s.get("background") or "")
+            s["background_opacity"] = min(90, max(10, _i(s.get("background_opacity"), 45)))
             s["autostart"] = bool(s.get("autostart"))
             s["panic_fallback"] = bool(s.get("panic_fallback", True))
             s["start_hidden"] = bool(s.get("start_hidden", False))
@@ -2474,6 +2477,8 @@ def apply_theme(root):
     st.configure("Treeview.Heading", background=HEAD, foreground=TEXT,
                  font=("Microsoft YaHei UI", 9, "bold"), bordercolor=BORDER)
     st.map("Treeview", background=[("selected", SEL)], foreground=[("selected", TEXT)])
+    st.configure("Link.TLabel", background=BG, foreground=ACCENT,
+                 font=("Microsoft YaHei UI", 9, "underline"))
     try:
         root.option_add("*TCombobox*Listbox.background", FIELD)
         root.option_add("*TCombobox*Listbox.foreground", TEXT)
@@ -4013,8 +4018,11 @@ class AboutDialog(object):
         self.top, frm = make_dialog(parent, "关于 %s" % APP_NAME, padding=20)
         ttk.Label(frm, text="%s  v%s" % (APP_NAME, APP_VERSION),
                   font=("Microsoft YaHei UI", 14, "bold")).pack(anchor="w")
-        ttk.Label(frm, text="由 %s 制作   ·   © %s" % (AUTHOR, time.strftime("%Y")),
-                  foreground=MUTED).pack(anchor="w", pady=(4, 12))
+        byline = tk.Label(frm, text="由 %s 制作   ·   © %s  ↗" % (AUTHOR, time.strftime("%Y")),
+                          fg=ACCENT, bg=BG, cursor="hand2",
+                          font=("Microsoft YaHei UI", 9, "underline"))
+        byline.pack(anchor="w", pady=(4, 12))
+        byline.bind("<Button-1>", lambda e: self._open_latest())
         ttk.Separator(frm).pack(fill="x", pady=(0, 12))
         ttk.Label(frm, text="开源地址（点击打开）").pack(anchor="w")
         link = tk.Label(frm, text=PROJECT_URL, fg=ACCENT, bg=BG, cursor="hand2",
@@ -4028,6 +4036,7 @@ class AboutDialog(object):
         bar = ttk.Frame(frm)
         bar.pack(fill="x")
         ttk.Button(bar, text="打开项目主页", command=self._open).pack(side="left")
+        ttk.Button(bar, text="最新版本", command=self._open_latest).pack(side="left", padx=(8, 0))
         ttk.Button(bar, text="复制网址", command=self._copy).pack(side="left", padx=(8, 0))
         ttk.Button(bar, text="关闭", command=lambda: close_dialog(self.top)).pack(side="right")
         center_dialog(self.top, parent, 120, 80)
@@ -4036,6 +4045,12 @@ class AboutDialog(object):
     def _open(self):
         try:
             webbrowser.open(PROJECT_URL)
+        except Exception:
+            pass
+
+    def _open_latest(self):
+        try:
+            webbrowser.open(LATEST_URL)
         except Exception:
             pass
 
@@ -4053,6 +4068,8 @@ class SettingsDialog(object):
     def __init__(self, parent, config, app=None):
         self.config, self.app, self.ok = config, app, False
         self._old_theme = config.settings.get("theme", "light")
+        self._old_opacity = _i(config.settings.get("background_opacity"), 45)
+        self._old_background = config.settings.get("background", "")
         self.top = tk.Toplevel(parent)
         self.top.title("设置")
         self.top.configure(bg=BG)
@@ -4139,6 +4156,21 @@ class SettingsDialog(object):
         ttk.Button(f2, text="不使用背景图", command=self._clear_bg).grid(
             row=row, column=1, sticky="w", pady=(2, 8))
         row += 1
+        ttk.Separator(f2).grid(row=row, column=0, columnspan=3, sticky="ew", pady=8)
+        row += 1
+        ttk.Label(f2, text="面板不透明度").grid(row=row, column=0, sticky="w", pady=4)
+        self.op_var = tk.IntVar(value=_i(st.get("background_opacity"), 45))
+        self.op_label = tk.StringVar(value="%d%%" % self.op_var.get())
+        obox = ttk.Frame(f2)
+        obox.grid(row=row, column=1, columnspan=2, sticky="ew")
+        ttk.Scale(obox, from_=10, to=90, orient="horizontal", variable=self.op_var,
+                  command=self._preview_opacity).pack(side="left", fill="x", expand=True)
+        ttk.Label(obox, textvariable=self.op_label, width=5).pack(side="left", padx=(8, 0))
+        row += 1
+        ttk.Label(f2, text="启用背景图时内容面板会半透明透出图片；数值越小越透、越大越清晰。",
+                  foreground=MUTED, wraplength=400, justify="left").grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(2, 4))
+        row += 1
         ttk.Label(f2, text="图片放在 %s\n选「浏览…」会自动复制进去。" % PICTURES_DIR,
                   foreground=MUTED, wraplength=400, justify="left").grid(
             row=row, column=0, columnspan=3, sticky="w")
@@ -4174,8 +4206,11 @@ class SettingsDialog(object):
 
         ttk.Label(f4, text="%s  v%s" % (APP_NAME, APP_VERSION),
                   font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="w")
-        ttk.Label(f4, text="由 %s 制作   ·   © %s" % (AUTHOR, time.strftime("%Y")),
-                  foreground=MUTED).pack(anchor="w", pady=(2, 10))
+        byline = tk.Label(f4, text="由 %s 制作   ·   © %s  ↗" % (AUTHOR, time.strftime("%Y")),
+                          fg=ACCENT, bg=BG, cursor="hand2",
+                          font=("Microsoft YaHei UI", 9, "underline"))
+        byline.pack(anchor="w", pady=(2, 10))
+        byline.bind("<Button-1>", lambda e: self._open_latest_url())
         link = tk.Label(f4, text=PROJECT_URL, fg=ACCENT, bg=BG, cursor="hand2",
                         font=("Microsoft YaHei UI", 9, "underline"))
         link.pack(anchor="w")
@@ -4207,6 +4242,12 @@ class SettingsDialog(object):
     def _preview_bg(self):
         if self.app:
             self.app.preview_background(self.bg_var.get())
+
+    def _preview_opacity(self, value=None):
+        v = min(90, max(10, _i(self.op_var.get(), 45)))
+        self.op_label.set("%d%%" % v)
+        if self.app:
+            self.app.preview_opacity(v)
 
     def _browse_bg(self):
         from tkinter import filedialog
@@ -4276,6 +4317,12 @@ class SettingsDialog(object):
         except Exception:
             pass
 
+    def _open_latest_url(self):
+        try:
+            webbrowser.open(LATEST_URL)
+        except Exception:
+            pass
+
     def _copy_url(self):
         try:
             self.top.clipboard_clear()
@@ -4294,6 +4341,7 @@ class SettingsDialog(object):
         s["autostart"] = bool(self.auto_var.get())
         s["script_enabled"] = bool(self.script_var.get())
         s["restore_cursor"] = bool(self.restore_var.get())
+        s["background_opacity"] = min(90, max(10, _i(self.op_var.get(), 45)))
         autostart_set(s["autostart"], hidden=s["start_hidden"])
         self.config.save()
         self.ok = True
@@ -4306,7 +4354,8 @@ class SettingsDialog(object):
         if not self.ok and self.app:
             try:
                 self.app.preview_theme(self._old_theme)
-                self.app.preview_background(self.config.settings.get("background", ""))
+                self.app.config.settings["background_opacity"] = self._old_opacity
+                self.app.preview_background(self._old_background)
             except Exception:
                 pass
         close_dialog(self.top)
@@ -4380,10 +4429,53 @@ class App(object):
                 pass
         self._resize_job = self.root.after(150, self._refresh_background)
 
+    def _glass_off(self):
+        """关闭背景图: 移除所有面板底图 Canvas, 恢复不透明主题色。"""
+        try:
+            self.root.attributes("-alpha", 1.0)
+            self.root.configure(bg=BG)
+            self.bg_canvas.configure(bg=BG)
+        except Exception:
+            pass
+        self._remove_glass_canvases()
+        self._glass_active = False
+        self._panel_color = BG
+        self._reset_glass()
+        self._paint_tabs()
+
+    def _iter_panel_frames(self, widget=None):
+        """遍历主界面里所有作为布局容器的 Frame(底图 Canvas 不是 Frame, 自动排除)。"""
+        w = widget if widget is not None else self.root
+        for child in w.winfo_children():
+            if isinstance(child, (tk.Frame, ttk.Frame)):
+                yield child
+                for sub in self._iter_panel_frames(child):
+                    yield sub
+
+    def _remove_glass_canvases(self):
+        for frame in list(self._iter_panel_frames()):
+            cv = getattr(frame, "_glass_canvas", None)
+            if cv is not None:
+                try:
+                    cv.destroy()
+                except Exception:
+                    pass
+                frame._glass_canvas = None
+
     def _reset_glass(self):
+        """不透明模式: 容器走 clam 默认背景, 文字带底色。"""
         st = ttk.Style()
-        st.configure("Glass.TFrame", background=BG)
-        st.configure("Glass.TLabel", background=BG, foreground=TEXT)
+        for style in ("Glass.TFrame", "Glass.TLabel", "Link.TLabel", "Outer.TFrame"):
+            st.layout(style, st.layout(style.split(".", 1)[-1]))
+        st.configure("Outer.TFrame", background=BG, bordercolor=BG,
+                     lightcolor=BG, darkcolor=BG)
+        st.configure("Glass.TFrame", background=BG, bordercolor=BG,
+                     lightcolor=BG, darkcolor=BG)
+        st.configure("Glass.TLabel", background=BG, foreground=TEXT,
+                     bordercolor=BG, lightcolor=BG, darkcolor=BG)
+        st.configure("Link.TLabel", background=BG, foreground=ACCENT,
+                     bordercolor=BG, lightcolor=BG, darkcolor=BG,
+                     font=("Microsoft YaHei UI", 9, "underline"))
         st.configure("Glass.Treeview", background=CARD, fieldbackground=CARD,
                      foreground=TEXT, rowheight=28, borderwidth=0, bordercolor=BORDER)
         st.configure("Glass.Treeview.Heading", background=HEAD, foreground=TEXT,
@@ -4392,6 +4484,9 @@ class App(object):
                foreground=[("selected", TEXT)])
 
     def _refresh_background(self):
+        """背景图: 窗口底层画清晰原图; 每个面板容器内部铺一层底图 Canvas,
+        以负坐标偏移绘制同一张半透明磨砂图 —— 面板整体半透明且与背景像素对齐,
+        既不会挡住背景图, 也不会透出桌面。"""
         name = (self.config.settings.get("background") or "").strip()
         try:
             self.bg_canvas.delete("all")
@@ -4401,7 +4496,7 @@ class App(object):
         if not path or not os.path.isfile(path):
             self.bg_canvas.configure(bg=BG)
             self._bg_photo = None
-            self._reset_glass()
+            self._glass_off()
             self._bg_margin = 0
             self._layout_outer()
             return
@@ -4414,26 +4509,72 @@ class App(object):
             img = img.resize((max(1, int(rw * scale)), max(1, int(rh * scale))), Image.LANCZOS)
             left, top = max(0, (img.size[0] - w) // 2), max(0, (img.size[1] - h) // 2)
             img = img.crop((left, top, left + w, top + h))
-            avg = img.resize((1, 1)).getpixel((0, 0))
-            panel = _mix_hex(_rgb_hex(avg), CARD, 0.18)
-            head_col = _mix_hex(_rgb_hex(avg), HEAD, 0.18)
-            st = ttk.Style()
-            st.configure("Glass.TFrame", background=panel)
-            st.configure("Glass.TLabel", background=panel, foreground=TEXT)
-            st.configure("Glass.Treeview", background=panel, fieldbackground=panel,
-                         foreground=TEXT, rowheight=28, borderwidth=0, bordercolor=BORDER)
-            st.configure("Glass.Treeview.Heading", background=head_col, foreground=TEXT,
-                         font=("Microsoft YaHei UI", 9, "bold"), bordercolor=BORDER)
-            st.map("Glass.Treeview", background=[("selected", SEL)],
-                   foreground=[("selected", TEXT)])
+
+            op = min(90, max(10, _i(self.config.settings.get("background_opacity"), 45))) / 100.0
+            m = 18
             self._bg_photo = ImageTk.PhotoImage(img)
             self.bg_canvas.create_image(0, 0, anchor="nw", image=self._bg_photo)
-            self._bg_margin = 18
+
+            # 整窗半透明磨砂图, 供所有面板容器按自身绝对位置取用
+            frosted = Image.blend(img, Image.new("RGB", (w, h), _hex_rgb(CARD)), op)
+            self._frosted_photo = ImageTk.PhotoImage(frosted)
+            avg = frosted.resize((1, 1)).getpixel((0, 0))
+            panel = _rgb_hex(avg)
+            head_col = _mix_hex(panel, HEAD, 0.5)
+            self._panel_color = panel
+
+            st = ttk.Style()
+            # 文字去掉 border 元素, 只保留 label -> 不画色块, 直接浮在底图上
+            label_layout = [("Label.padding", {
+                "sticky": "nswe", "children": [("Label.label", {"sticky": "nswe"})]})]
+            st.layout("Glass.TLabel", label_layout)
+            st.layout("Link.TLabel", label_layout)
+            st.configure("Glass.TLabel", foreground=TEXT)
+            st.configure("Link.TLabel", foreground=ACCENT,
+                         font=("Microsoft YaHei UI", 9, "underline"))
+            # Treeview 由 clam 自绘, 用同色调磨砂色与整体协调
+            st.configure("Glass.Treeview", background=panel, fieldbackground=panel,
+                         foreground=TEXT, rowheight=28, borderwidth=0, bordercolor=panel)
+            st.configure("Glass.Treeview.Heading", background=head_col, foreground=TEXT,
+                         font=("Microsoft YaHei UI", 9, "bold"), bordercolor=head_col)
+            st.map("Glass.Treeview", background=[("selected", SEL)],
+                   foreground=[("selected", TEXT)])
+
+            self._glass_active = True
+            self._bg_margin = m
+            self._paint_tabs()
             self._layout_outer()
+            self._paint_glass_canvases()
         except Exception:
             self.bg_canvas.configure(bg=BG)
             self._bg_photo = None
-            self._reset_glass()
+            self._glass_off()
+
+    def _paint_glass_canvases(self):
+        """给每个面板容器铺底图; 按容器在窗口中的绝对位置负偏移, 拼接后严丝合缝。"""
+        if not getattr(self, "_glass_active", False):
+            return
+        try:
+            self.root.update_idletasks()   # 结算 pack/place, 保证容器坐标已稳定
+        except Exception:
+            pass
+        rx0, ry0 = self.root.winfo_rootx(), self.root.winfo_rooty()
+        for frame in self._iter_panel_frames():
+            try:
+                cv = getattr(frame, "_glass_canvas", None)
+                if cv is None:
+                    cv = tk.Canvas(frame, highlightthickness=0, bd=0, bg=BG)
+                    cv.place(x=0, y=0, relwidth=1, relheight=1)
+                    tk.Misc.lower(cv)
+                    frame._glass_canvas = cv
+                if not cv.winfo_exists():
+                    continue
+                x = frame.winfo_rootx() - rx0
+                y = frame.winfo_rooty() - ry0
+                cv.delete("all")
+                cv.create_image(-x, -y, anchor="nw", image=self._frosted_photo)
+            except Exception:
+                pass
 
     def apply_settings(self):
         set_theme(self.config.settings.get("theme", "light"))
@@ -4441,7 +4582,7 @@ class App(object):
 
     # ---- 界面 ----
     def _build(self):
-        self.outer = ttk.Frame(self.root, style="Glass.TFrame", padding=0)
+        self.outer = ttk.Frame(self.root, style="Outer.TFrame", padding=0)
         self._layout_outer()
         panel = self.outer
 
@@ -4473,14 +4614,28 @@ class App(object):
                    style="Danger.TButton").pack(side="right")
         self._refresh_presets()
 
-        self.nb = ttk.Notebook(panel)
-        self.nb.pack(fill="both", expand=True, padx=(16, 16), pady=(8, 4))
-        tab1 = ttk.Frame(self.nb, padding=8, style="Glass.TFrame")
-        tab2 = ttk.Frame(self.nb, padding=8, style="Glass.TFrame")
-        self.nb.add(tab1, text="  基础点击  ")
-        self.nb.add(tab2, text="  节点循环  ")
+        # 自制分区标签: ttk.Notebook 的 client 由 clam 引擎自绘不透明底色,
+        # 会整块挡住背景图, 因此改用可色键透明的普通 Frame + 标签按钮。
+        tabbar = ttk.Frame(panel, style="Glass.TFrame")
+        tabbar.pack(fill="x", padx=(16, 16), pady=(8, 0))
+        self._tab_labels = {}
+        for key, text in (("basic", "  基础点击  "), ("flow", "  节点循环  ")):
+            lab = tk.Label(tabbar, text=text, cursor="hand2", padx=8, pady=5,
+                           font=("Microsoft YaHei UI", 10),
+                           bg=BG, fg=TEXT, bd=0, highlightthickness=0)
+            lab.pack(side="left")
+            lab.bind("<Button-1>", lambda e, k=key: self._switch_tab(k))
+            self._tab_labels[key] = lab
+
+        host = ttk.Frame(panel, style="Glass.TFrame")
+        host.pack(fill="both", expand=True, padx=(16, 16), pady=(0, 4))
+        tab1 = ttk.Frame(host, padding=8, style="Glass.TFrame")
+        tab2 = ttk.Frame(host, padding=8, style="Glass.TFrame")
+        self._tab_frames = {"basic": tab1, "flow": tab2}
         self._build_table(tab1, "basic")
         self._build_table(tab2, "flow")
+        self._active_tab = "basic"
+        self._switch_tab("basic")
 
         foot = ttk.Frame(panel, padding=(16, 4, 16, 10), style="Glass.TFrame")
         foot.pack(fill="x")
@@ -4489,7 +4644,57 @@ class App(object):
                   style="Glass.TLabel").pack(side="left")
         self.foot_right = ttk.Label(foot, foreground=MUTED, style="Glass.TLabel")
         self.foot_right.pack(side="right")
+        self.author_link = ttk.Label(foot, text="由 %s 制作" % AUTHOR,
+                                     style="Link.TLabel", cursor="hand2")
+        self.author_link.pack(side="right", padx=(0, 10))
+        self.author_link.bind("<Button-1>", lambda e: self._open_latest())
+        self.author_link.bind("<Enter>",
+                              lambda e: self.tip.set("点击查看 GitHub 最新版本页面: %s" % LATEST_URL))
+        self.author_link.bind("<Leave>", lambda e: self._restore_tip())
         self._update_foot()
+
+    def _open_latest(self):
+        """署名链接: 打开项目最新版本页面(始终指向最新, 不会因版本更新而失效)。"""
+        try:
+            webbrowser.open(LATEST_URL)
+        except Exception:
+            pass
+
+    def _restore_tip(self):
+        try:
+            self._refresh_tree()
+        except Exception:
+            pass
+
+    def _switch_tab(self, kind):
+        self._active_tab = kind
+        for k, frame in self._tab_frames.items():
+            if k == kind:
+                frame.pack(fill="both", expand=True)
+            else:
+                frame.pack_forget()
+        self._paint_tabs()
+        if getattr(self, "_glass_active", False):
+            try:
+                self.root.after(60, self._paint_glass_canvases)
+            except Exception:
+                pass
+
+    def _paint_tabs(self):
+        """分区标签配色随背景图状态切换。"""
+        labels = getattr(self, "_tab_labels", None)
+        if not labels:            # _setup_background() 早于 _build(), 此时标签还没创建
+            return
+        glass = getattr(self, "_glass_active", False)
+        panel = getattr(self, "_panel_color", BG)
+        for k, lab in labels.items():
+            active = (k == self._active_tab)
+            try:
+                lab.configure(bg=panel if glass else BG,
+                              fg=ACCENT if active else TEXT,
+                              font=("Microsoft YaHei UI", 10, "bold" if active else "normal"))
+            except Exception:
+                pass
 
     def _build_table(self, parent, kind):
         bar = ttk.Frame(parent, style="Glass.TFrame")
@@ -4529,16 +4734,13 @@ class App(object):
 
     def _update_foot(self):
         try:
-            self.foot_right.configure(text="配置: %s  ·  %s 制作" % (CONFIG_FILE, AUTHOR))
+            self.foot_right.configure(text="配置: %s" % CONFIG_FILE)
         except Exception:
             pass
 
     # ---- 数据同步 ----
     def _active_kind(self):
-        try:
-            return "flow" if self.nb.index(self.nb.select()) == 1 else "basic"
-        except Exception:
-            return "basic"
+        return getattr(self, "_active_tab", "basic")
 
     def _status_text(self, item):
         due = self._sched_due.get(item["id"])
@@ -4707,7 +4909,7 @@ class App(object):
             pass
         self.config.bindings.append(b)
         self.save_and_rebuild()
-        self.nb.select(0)
+        self._switch_tab("basic")
         self.tree.selection_set(b["id"])
 
     # ---- 方案 ----
@@ -4846,6 +5048,11 @@ class App(object):
 
     def preview_background(self, name):
         self.config.settings["background"] = name or ""
+        self._refresh_background()
+
+    def preview_opacity(self, value):
+        """设置里拖动不透明度滑块时即时预览(不写盘, 保存时才落配置)。"""
+        self.config.settings["background_opacity"] = value
         self._refresh_background()
 
     def rebuild_after_settings(self):
@@ -5268,7 +5475,18 @@ def run_selftest():
        seq and seq[-2:] == ["right", "right"] and seq.count("left") < 1000,
        "left=%d right=%d" % (seq.count("left"), seq.count("right")))
 
-    # 15. 引擎 stop_all 保留计数
+    # 15. v1.4.5: 背景不透明度配置与最新版本链接
+    c4 = Config._sanitize({"version": 3, "settings": {"background_opacity": 500}})
+    ck("背景不透明度上限钳制", c4["settings"]["background_opacity"] == 90,
+       c4["settings"]["background_opacity"])
+    c5 = Config._sanitize({"version": 3, "settings": {"background_opacity": 0}})
+    ck("背景不透明度下限钳制", c5["settings"]["background_opacity"] == 10,
+       c5["settings"]["background_opacity"])
+    ck("默认背景不透明度", default_config()["settings"]["background_opacity"] == 45)
+    ck("最新版本链接指向 releases/latest",
+       LATEST_URL == PROJECT_URL + "/releases/latest", LATEST_URL)
+
+    # 16. 引擎 stop_all 保留计数
     cfg = Config()
     eng = Engine(cfg)
     cfg.bindings = [b]

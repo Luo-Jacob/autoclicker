@@ -10,6 +10,10 @@
 任一条线升级时**不需要**另一条同步发版；只更新对应目录、对应行的条目与对应 Release。
 两侧的共用部分只有根 `README.md` 的双轨说明、本文件与 MIT 许可。
 
+> **发版约定**：GitHub 的 `releases/latest`（程序里「最新版本」链接指向它）固定给 **Python GUI 版**，
+> 因为它是主产品。C++ 线发版时用 `gh release create cpp-v1.x.y --latest=false`，
+> 发完再确认一次 `gh release list` 里 `v1.5.x` 仍标着 `Latest`。
+
 ---
 
 ## Python GUI 版

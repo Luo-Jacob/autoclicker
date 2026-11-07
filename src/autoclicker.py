@@ -35,6 +35,7 @@ from ctypes import wintypes
 
 import tkinter as tk
 from tkinter import ttk, messagebox
+import tkinter.font as tkfont
 
 try:
     from pynput import keyboard as _pkb
@@ -42,7 +43,7 @@ except Exception:
     _pkb = None
 
 APP_NAME = "AutoClicker"
-APP_VERSION = "1.4.5"
+APP_VERSION = "1.4.6"
 MUTEX_NAME = "Global\\AutoClicker_SingleInstance"
 AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
@@ -2495,6 +2496,318 @@ def apply_theme(root):
         pass
 
 
+def _rgba(hex_color, alpha):
+    """把 #rrggbb 转成 PIL 用的 (r,g,b,a)。"""
+    return _hex_rgb(hex_color) + (max(0, min(255, int(alpha))),)
+
+
+class GlassTable(tk.Frame):
+    """Canvas 自绘表格 —— 替掉 ttk.Treeview, 让表格区也能透出背景图。
+
+    ttk.Treeview 的 field / heading 由 clam 引擎强制自绘不透明底色, 样式、
+    色键透明、st.layout() 都无法改变。这里改为: 用 PIL 把「背景图裁片 +
+    半透明表头/行带/选中高亮」合成为一张底图贴在 Canvas 上, 文字用
+    create_text 浮在图上 —— 背景纹理完整可见, 同时保证文字可读。
+
+    对外保持 ttk.Treeview 的常用 API(heading/column/insert/item/delete/
+    exists/get_children/selection/selection_set/tag_configure/yview/bind),
+    因此调用方几乎无需改动。
+    """
+
+    HEAD_H = 30
+    ROW_H = 28
+    _MOUSE_SEQ = ("<Button", "<Double", "<Triple", "<Motion", "<Enter",
+                  "<Leave", "<MouseWheel", "<B1", "<B2", "<B3")
+
+    def __init__(self, parent, columns=(), show="headings", selectmode="browse",
+                 height=6, style=None, glass_provider=None, **kw):
+        kw.pop("style", None)
+        tk.Frame.__init__(self, parent, bd=0, highlightthickness=0, bg=BG, **kw)
+        self._app = glass_provider
+        self._cols = list(columns)
+        self._heads, self._widths, self._anchors = {}, {}, {}
+        self._rows, self._index, self._tags = [], {}, {}
+        self._auto = 0
+        self._sel = None
+        self._offset = 0.0
+        self._yscroll_cb = None
+        self._pending = False
+        self._bg_photo = None
+        self._font = tkfont.Font(family="Microsoft YaHei UI", size=9)
+        self._head_font = tkfont.Font(family="Microsoft YaHei UI", size=9, weight="bold")
+        self.canvas = tk.Canvas(self, highlightthickness=0, bd=0, bg=CARD)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.canvas.bind("<Button-1>", self._on_click)
+        self.canvas.bind("<MouseWheel>", self._on_wheel)
+        self.canvas.bind("<Configure>", lambda e: self._schedule())
+
+    # ---- ttk.Treeview 兼容 API ----
+    def configure(self, cnf=None, **kw):
+        if "yscrollcommand" in kw:
+            self._yscroll_cb = kw.pop("yscrollcommand")
+        if cnf is None:
+            return tk.Frame.configure(self, **kw)
+        return tk.Frame.configure(self, cnf, **kw)
+
+    config = configure
+
+    def heading(self, col, text=None, **kw):
+        if text is not None:
+            self._heads[col] = text
+        self._schedule()
+        return ""
+
+    def column(self, col, width=None, anchor=None, **kw):
+        if width is not None:
+            self._widths[col] = max(24, int(width))
+        if anchor is not None:
+            self._anchors[col] = anchor
+        self._schedule()
+        return ""
+
+    def tag_configure(self, tag, foreground=None, **kw):
+        if foreground is not None:
+            self._tags.setdefault(tag, {})["foreground"] = foreground
+        self._schedule()
+        return ""
+
+    def insert(self, parent="", index="end", iid=None, values=(), tags=()):
+        if iid is None:
+            self._auto += 1
+            iid = "I%d" % self._auto
+        iid = str(iid)
+        if isinstance(tags, str):
+            tags = (tags,)
+        row = {"iid": iid, "values": tuple(values), "tags": tuple(tags)}
+        if iid in self._index:
+            self._rows[self._index[iid]] = row
+        else:
+            self._index[iid] = len(self._rows)
+            self._rows.append(row)
+        self._schedule()
+        return iid
+
+    def delete(self, *iids):
+        gone = {str(i) for i in iids}
+        self._rows = [r for r in self._rows if r["iid"] not in gone]
+        self._reindex()
+        if self._sel in gone:
+            self._sel = None
+        self._schedule()
+
+    def item(self, iid, values=None, tags=None, **kw):
+        iid = str(iid)
+        idx = self._index.get(iid)
+        if idx is None:
+            return {}
+        row = self._rows[idx]
+        if isinstance(tags, str):
+            tags = (tags,)
+        new_tags = tuple(tags) if tags is not None else row["tags"]
+        new_vals = tuple(values) if values is not None else row["values"]
+        if new_vals == row["values"] and new_tags == row["tags"]:
+            return {}          # 250ms 轮询刷新时, 值没变就不重绘
+        row["values"], row["tags"] = new_vals, new_tags
+        self._schedule()
+        return {}
+
+    def exists(self, iid):
+        return str(iid) in self._index
+
+    def get_children(self, parent=""):
+        return [r["iid"] for r in self._rows]
+
+    def selection(self):
+        return (self._sel,) if self._sel else ()
+
+    def selection_set(self, *iids):
+        self._sel = str(iids[0]) if iids else None
+        self._schedule()
+
+    def bind(self, sequence=None, func=None, add=None):
+        if sequence and any(sequence.startswith(p) for p in self._MOUSE_SEQ):
+            return self.canvas.bind(sequence, func, add)
+        return tk.Frame.bind(self, sequence, func, add)
+
+    def yview(self, *args):
+        view = max(1, self.canvas.winfo_height() - self.HEAD_H)
+        total = len(self._rows) * self.ROW_H
+        maxoff = max(0, total - view)
+        if args:
+            if args[0] == "moveto":
+                self._offset = float(args[1]) * maxoff
+            elif args[0] == "scroll":
+                n = int(float(args[1]))
+                unit = args[2] if len(args) > 2 else "units"
+                step = self.ROW_H if unit == "units" else view
+                self._offset += n * step
+            self._offset = max(0.0, min(float(maxoff), self._offset))
+            self._update_scrollbar()
+            self._redraw()
+            return None
+        if total <= view:
+            return (0.0, 1.0)
+        return (self._offset / float(total), min(1.0, (self._offset + view) / float(total)))
+
+    def redraw_now(self):
+        """外部(背景/主题/尺寸变化)强制重绘。"""
+        self._pending = False
+        try:
+            self._redraw()
+        except Exception:
+            pass
+
+    # ---- 内部 ----
+    def _reindex(self):
+        self._index = {r["iid"]: i for i, r in enumerate(self._rows)}
+
+    def _schedule(self):
+        if self._pending:
+            return
+        self._pending = True
+        try:
+            self.after_idle(self._flush)
+        except Exception:
+            self._flush()
+
+    def _flush(self):
+        self._pending = False
+        try:
+            self._redraw()
+        except Exception:
+            pass
+
+    def _update_scrollbar(self):
+        if self._yscroll_cb is None:
+            return
+        try:
+            a, b = self.yview()
+            self._yscroll_cb(a, b)
+        except Exception:
+            pass
+
+    def _on_click(self, event):
+        if event.y < self.HEAD_H:
+            self._sel = None
+        else:
+            idx = int((event.y - self.HEAD_H + self._offset) // self.ROW_H)
+            self._sel = self._rows[idx]["iid"] if 0 <= idx < len(self._rows) else None
+        self._schedule()
+
+    def _on_wheel(self, event):
+        n = -int(event.delta / 120.0) if abs(event.delta) >= 120 else (-1 if event.delta > 0 else 1)
+        self.yview("scroll", n * 3, "units")
+        return "break"
+
+    def _glass_base(self, w, h):
+        """返回 (是否半透明模式, RGB 底图)。半透明时从整窗磨砂图裁出本控件对应区域。"""
+        from PIL import Image
+        app = self._app
+        if app is not None and getattr(app, "_glass_active", False) \
+                and getattr(app, "_frosted_image", None) is not None:
+            try:
+                rx, ry = app.root.winfo_rootx(), app.root.winfo_rooty()
+                x = self.canvas.winfo_rootx() - rx
+                y = self.canvas.winfo_rooty() - ry
+                img = app._frosted_image
+                base = Image.new("RGB", (w, h), _hex_rgb(CARD))
+                ix0, iy0 = max(0, x), max(0, y)
+                ix1, iy1 = min(img.width, x + w), min(img.height, y + h)
+                if ix1 > ix0 and iy1 > iy0:
+                    base.paste(img.crop((ix0, iy0, ix1, iy1)), (ix0 - x, iy0 - y))
+                return True, base
+            except Exception:
+                pass
+        return False, Image.new("RGB", (w, h), _hex_rgb(CARD))
+
+    def _clip(self, text, width):
+        if width <= 10:
+            return ""
+        if self._font.measure(text) <= width:
+            return text
+        while text and self._font.measure(text + "…") > width:
+            text = text[:-1]
+        return text + "…"
+
+    def _redraw(self):
+        from PIL import Image, ImageDraw, ImageTk
+        cv = self.canvas
+        w, h = max(1, cv.winfo_width()), max(1, cv.winfo_height())
+        cv.delete("all")
+        if w <= 2 or h <= 2:
+            return
+        cols = self._cols
+        if not cols:
+            return
+        minw = [self._widths.get(c, 80) for c in cols]
+        total = sum(minw) or 1
+        if w > total:
+            extra = w - total
+            widths = [mw + int(extra * mw / float(total)) for mw in minw]
+            widths[-1] += w - sum(widths)
+        else:
+            widths = minw[:]
+        glass, base = self._glass_base(w, h)
+
+        ov = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        d = ImageDraw.Draw(ov)
+        # 表头: 半透明模式只叠薄薄一层, 背景纹理仍可见
+        d.rectangle([0, 0, w, self.HEAD_H], fill=_rgba(HEAD, 150 if glass else 255))
+        d.line([(0, self.HEAD_H - 1), (w, self.HEAD_H - 1)],
+               fill=_rgba(BORDER, 140 if glass else 255), width=1)
+        # 行带: 交替底色用低 alpha, 保证文字可读又不挡住背景图
+        first = max(0, int(self._offset // self.ROW_H))
+        for i in range(first, len(self._rows)):
+            yy = int(self.HEAD_H + i * self.ROW_H - self._offset)
+            if yy > h:
+                break
+            if yy + self.ROW_H < self.HEAD_H:
+                continue
+            selected = self._rows[i]["iid"] == self._sel
+            if selected:
+                # 高亮只叠薄薄一层, 背景图仍在; 左侧加一条实色强调条便于辨识
+                d.rectangle([0, yy, w, yy + self.ROW_H - 1],
+                            fill=_rgba(SEL if not glass else ACCENT, 90 if glass else 255))
+                d.rectangle([0, yy, 3, yy + self.ROW_H - 1], fill=_rgba(ACCENT, 255))
+            elif i % 2:
+                d.rectangle([0, yy, w, yy + self.ROW_H - 1],
+                            fill=_rgba(CARD if glass else HEAD, 55 if glass else 150))
+            d.line([(0, yy + self.ROW_H - 1), (w, yy + self.ROW_H - 1)],
+                   fill=_rgba(BORDER, 70 if glass else 150), width=1)
+        comp = Image.alpha_composite(base.convert("RGBA"), ov).convert("RGB")
+        self._bg_photo = ImageTk.PhotoImage(comp)
+        cv.create_image(0, 0, anchor="nw", image=self._bg_photo, tags="__glassbg__")
+
+        # 文字层
+        for ci, c in enumerate(cols):
+            x0 = sum(widths[:ci])
+            anchor = self._anchors.get(c, "w")
+            tx = x0 + widths[ci] / 2.0 if anchor == "center" else x0 + 8
+            cv.create_text(tx, self.HEAD_H / 2.0, text=self._heads.get(c, c),
+                           anchor=anchor, font=self._head_font, fill=TEXT)
+        for i in range(first, len(self._rows)):
+            yy = int(self.HEAD_H + i * self.ROW_H - self._offset)
+            if yy > h:
+                break
+            if yy + self.ROW_H < self.HEAD_H:
+                continue
+            row = self._rows[i]
+            tag = row["tags"][0] if row["tags"] else ""
+            color = self._tags.get(tag, {}).get("foreground", TEXT)
+            if row["iid"] == self._sel and color == MUTED:
+                color = TEXT          # 灰色状态文字在高亮行上提亮, 保证可读
+            font = self._head_font if row["iid"] == self._sel else self._font
+            cy = yy + self.ROW_H / 2.0
+            for ci, c in enumerate(cols):
+                val = str(row["values"][ci]) if ci < len(row["values"]) else ""
+                x0 = sum(widths[:ci])
+                anchor = self._anchors.get(c, "w")
+                tx = x0 + widths[ci] / 2.0 if anchor == "center" else x0 + 8
+                cv.create_text(tx, cy, text=self._clip(val, widths[ci] - 14),
+                               anchor=anchor, font=font, fill=color)
+        self._update_scrollbar()
+
+
 UI_QUEUE = queue.Queue()
 
 
@@ -4370,6 +4683,11 @@ class App(object):
         self._was_running = False
         self._closing = False
         self._sched_due = {}
+        self._glass_tables = []       # 主界面 Canvas 自绘表格
+        self._glass_active = False
+        self._frosted_image = None
+        self._frosted_photo = None
+        self._panel_color = BG
 
         self.root.title("%s  v%s" % (APP_NAME, APP_VERSION))
         self.root.geometry("1000x620")
@@ -4400,6 +4718,7 @@ class App(object):
 
     def _setup_background(self):
         self._bg_photo, self._bg_item, self._bg_margin = None, None, 0
+        self._frosted_image, self._frosted_photo = None, None
         self.bg_canvas = tk.Canvas(self.root, highlightthickness=0, bd=0, bg=BG)
         self.bg_canvas.place(x=0, y=0, relwidth=1, relheight=1)
         try:
@@ -4440,13 +4759,24 @@ class App(object):
         self._remove_glass_canvases()
         self._glass_active = False
         self._panel_color = BG
+        self._frosted_image, self._frosted_photo = None, None
         self._reset_glass()
         self._paint_tabs()
+        self._redraw_glass_tables()
+
+    def _redraw_glass_tables(self):
+        for t in getattr(self, "_glass_tables", ()):
+            try:
+                t.redraw_now()
+            except Exception:
+                pass
 
     def _iter_panel_frames(self, widget=None):
         """遍历主界面里所有作为布局容器的 Frame(底图 Canvas 不是 Frame, 自动排除)。"""
         w = widget if widget is not None else self.root
         for child in w.winfo_children():
+            if isinstance(child, GlassTable):
+                continue          # 自绘表格自己画背景, 不需要再铺一层
             if isinstance(child, (tk.Frame, ttk.Frame)):
                 yield child
                 for sub in self._iter_panel_frames(child):
@@ -4476,12 +4806,8 @@ class App(object):
         st.configure("Link.TLabel", background=BG, foreground=ACCENT,
                      bordercolor=BG, lightcolor=BG, darkcolor=BG,
                      font=("Microsoft YaHei UI", 9, "underline"))
-        st.configure("Glass.Treeview", background=CARD, fieldbackground=CARD,
-                     foreground=TEXT, rowheight=28, borderwidth=0, bordercolor=BORDER)
-        st.configure("Glass.Treeview.Heading", background=HEAD, foreground=TEXT,
-                     font=("Microsoft YaHei UI", 9, "bold"), bordercolor=BORDER)
-        st.map("Glass.Treeview", background=[("selected", SEL)],
-               foreground=[("selected", TEXT)])
+        # 主表格为 GlassTable 自绘, 不需要 Glass.Treeview 样式;
+        # 对话框里的 ttk 表格仍走 apply_theme 里的基础 Treeview 样式。
 
     def _refresh_background(self):
         """背景图: 窗口底层画清晰原图; 每个面板容器内部铺一层底图 Canvas,
@@ -4515,12 +4841,12 @@ class App(object):
             self._bg_photo = ImageTk.PhotoImage(img)
             self.bg_canvas.create_image(0, 0, anchor="nw", image=self._bg_photo)
 
-            # 整窗半透明磨砂图, 供所有面板容器按自身绝对位置取用
+            # 整窗半透明磨砂图: 面板容器与自绘表格共用, 按各自绝对位置裁片
             frosted = Image.blend(img, Image.new("RGB", (w, h), _hex_rgb(CARD)), op)
+            self._frosted_image = frosted
             self._frosted_photo = ImageTk.PhotoImage(frosted)
             avg = frosted.resize((1, 1)).getpixel((0, 0))
             panel = _rgb_hex(avg)
-            head_col = _mix_hex(panel, HEAD, 0.5)
             self._panel_color = panel
 
             st = ttk.Style()
@@ -4532,13 +4858,8 @@ class App(object):
             st.configure("Glass.TLabel", foreground=TEXT)
             st.configure("Link.TLabel", foreground=ACCENT,
                          font=("Microsoft YaHei UI", 9, "underline"))
-            # Treeview 由 clam 自绘, 用同色调磨砂色与整体协调
-            st.configure("Glass.Treeview", background=panel, fieldbackground=panel,
-                         foreground=TEXT, rowheight=28, borderwidth=0, bordercolor=panel)
-            st.configure("Glass.Treeview.Heading", background=head_col, foreground=TEXT,
-                         font=("Microsoft YaHei UI", 9, "bold"), bordercolor=head_col)
-            st.map("Glass.Treeview", background=[("selected", SEL)],
-                   foreground=[("selected", TEXT)])
+            # 主表格已换 GlassTable 自绘, 底图直接取 frosted 裁片,
+            # 不再依赖 ttk.Treeview 的 field/heading 样式。
 
             self._glass_active = True
             self._bg_margin = m
@@ -4575,6 +4896,7 @@ class App(object):
                 cv.create_image(-x, -y, anchor="nw", image=self._frosted_photo)
             except Exception:
                 pass
+        self._redraw_glass_tables()
 
     def apply_settings(self):
         set_theme(self.config.settings.get("theme", "light"))
@@ -4710,8 +5032,11 @@ class App(object):
         wrap = ttk.Frame(parent, style="Glass.TFrame")
         wrap.pack(fill="both", expand=True)
         cols = ("status", "no", "name", "hotkey", "action", "rate", "mode", "count")
-        tree = ttk.Treeview(wrap, columns=cols, show="headings", selectmode="browse",
-                            style="Glass.Treeview")
+        # 主表格用 Canvas 自绘: ttk.Treeview 的 field 由 clam 强制画不透明底色,
+        # 无法透出背景图; GlassTable 保持相同 API, 底图直接取背景图裁片。
+        tree = GlassTable(wrap, columns=cols, show="headings",
+                          selectmode="browse", glass_provider=self)
+        self._glass_tables.append(tree)
         heads = {"status": "状态", "no": "#", "name": "名称", "hotkey": "启动热键",
                  "action": "动作 / 节点", "rate": "频率", "mode": "结束 / 轮数", "count": "已点击"}
         widths = {"status": 100, "no": 34, "name": 110, "hotkey": 120,
@@ -5498,6 +5823,21 @@ def run_selftest():
        "%d -> %d" % (before, eng.click_count(b["id"])))
     eng.shutdown()
     CLICK_SINK = None
+
+    # 17. v1.4.6: 主表格为 Canvas 自绘, 且保持 Treeview 兼容 API
+    # 注意: 不能用 inspect.getsource —— PyInstaller 打包后源文件不存在,
+    #       会抛 OSError 让 --selftest 崩溃。改用字节码 co_names。
+    _apis = ("heading", "column", "insert", "item", "delete", "exists",
+             "get_children", "selection", "selection_set", "tag_configure",
+             "yview", "bind", "configure", "redraw_now")
+    ck("GlassTable 具备 Treeview 兼容 API",
+       all(hasattr(GlassTable, a) for a in _apis),
+       [a for a in _apis if not hasattr(GlassTable, a)])
+    _names = GlassTable._redraw.__code__.co_names
+    ck("GlassTable 底图与文字均由 Canvas 绘制",
+       "create_image" in _names and "create_text" in _names)
+    ck("GlassTable 行带为半透明叠加而非纯色",
+       "_rgba" in _names and "alpha_composite" in _names)
 
     failed = [x for x in lines if x.startswith("FAIL")]
     text = "AutoClicker v%s selftest  %s\n%s\n\n%s\n" % (

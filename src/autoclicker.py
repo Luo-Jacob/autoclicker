@@ -43,7 +43,7 @@ except Exception:
     _pkb = None
 
 APP_NAME = "AutoClicker"
-APP_VERSION = "1.4.6"
+APP_VERSION = "1.5.0"
 MUTEX_NAME = "Global\\AutoClicker_SingleInstance"
 AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
@@ -238,6 +238,12 @@ def default_config():
             "theme": "light",
             "background": "",
             "background_opacity": 45,  # 启用背景图时内容面板的遮罩不透明度(0-100, 越小越透)
+            # v1.5 个性化
+            "accent": "blue",          # 强调色方案: blue | violet | teal | rose | amber
+            "density": "comfortable",  # 界面密度: compact | comfortable
+            "radius": 10,              # 圆角半径 0-18
+            "animations": True,        # 主题 / 分区切换的过渡动画
+            "badges": True,            # 状态徽标
             "script_enabled": False,   # 高级脚本默认关闭, 需显式开启
             "restore_cursor": True,    # 固定坐标点击后把光标移回原位
             "active_preset": 0,        # 0 = 当前工作集(不属于任何预设)
@@ -505,6 +511,13 @@ class Config(object):
                 s["theme"] = "light"
             s["background"] = str(s.get("background") or "")
             s["background_opacity"] = min(90, max(10, _i(s.get("background_opacity"), 45)))
+            if s.get("accent") not in ACCENTS:
+                s["accent"] = "blue"
+            if s.get("density") not in ("compact", "comfortable"):
+                s["density"] = "comfortable"
+            s["radius"] = min(18, max(0, _i(s.get("radius"), 10)))
+            s["animations"] = bool(s.get("animations", True))
+            s["badges"] = bool(s.get("badges", True))
             s["autostart"] = bool(s.get("autostart"))
             s["panic_fallback"] = bool(s.get("panic_fallback", True))
             s["start_hidden"] = bool(s.get("start_hidden", False))
@@ -2389,23 +2402,54 @@ def make_ico(path):
 # ---------------------------------------------------------------------------
 # 主题
 # ---------------------------------------------------------------------------
+ACCENTS = {
+    "blue": ("#2563eb", "经典蓝"),
+    "violet": ("#7c3aed", "紫罗兰"),
+    "teal": ("#0d9488", "青绿"),
+    "rose": ("#e11d48", "玫红"),
+    "amber": ("#d97706", "琥珀"),
+}
+
 THEMES = {
     "light": {
-        "BG": "#f4f6f9", "CARD": "#ffffff", "TEXT": "#1f2937", "MUTED": "#6b7280",
-        "ACCENT": "#2563eb", "DANGER": "#dc2626", "HEAD": "#e5e7eb", "SEL": "#dbeafe",
-        "FIELD": "#ffffff", "BORDER": "#d1d5db",
+        "BG": "#f4f6f9", "CARD": "#ffffff", "CARD2": "#f8fafc",
+        "TEXT": "#1f2937", "MUTED": "#6b7280",
+        "ACCENT": "#2563eb", "DANGER": "#dc2626", "HEAD": "#eef2f7", "SEL": "#dbeafe",
+        "FIELD": "#ffffff", "BORDER": "#e2e8f0", "RING": "#cbd5e1",
+        "OK": "#16a34a", "WARN": "#d97706", "GHOST": "#eef4ff",
     },
     "dark": {
-        "BG": "#1b1e24", "CARD": "#252a32", "TEXT": "#e6e9ef", "MUTED": "#98a1b0",
-        "ACCENT": "#5b93ff", "DANGER": "#ef4444", "HEAD": "#31363f", "SEL": "#33415c",
-        "FIELD": "#2b3038", "BORDER": "#3c4453",
+        # v1.5 重做: 更深的中性底 + 分层卡片, 不再是亮色的简单反色
+        "BG": "#11141a", "CARD": "#1b2029", "CARD2": "#232a35",
+        "TEXT": "#e8edf6", "MUTED": "#94a1b5",
+        "ACCENT": "#5b93ff", "DANGER": "#f87171", "HEAD": "#262d39", "SEL": "#2c3a55",
+        "FIELD": "#1d232d", "BORDER": "#323b49", "RING": "#3b4657",
+        "OK": "#4ade80", "WARN": "#fbbf24", "GHOST": "#263146",
     },
 }
 _c = THEMES["light"]
-BG, CARD, TEXT, MUTED = _c["BG"], _c["CARD"], _c["TEXT"], _c["MUTED"]
+BG, CARD, CARD2, TEXT, MUTED = _c["BG"], _c["CARD"], _c["CARD2"], _c["TEXT"], _c["MUTED"]
 ACCENT, DANGER, HEAD, SEL = _c["ACCENT"], _c["DANGER"], _c["HEAD"], _c["SEL"]
-FIELD, BORDER = _c["FIELD"], _c["BORDER"]
+FIELD, BORDER, RING = _c["FIELD"], _c["BORDER"], _c["RING"]
+OK, WARN, GHOST = _c["OK"], _c["WARN"], _c["GHOST"]
 CURRENT_THEME = "light"
+CURRENT_ACCENT = "blue"
+CURRENT_DENSITY = "comfortable"
+CURRENT_RADIUS = 10
+ANIMATIONS = True
+BADGES = True
+
+
+def apply_personal(settings):
+    """把个性化设置同步到模块级状态与自绘表格的行高。"""
+    global CURRENT_DENSITY, CURRENT_RADIUS, ANIMATIONS, BADGES
+    CURRENT_DENSITY = settings.get("density") if settings.get("density") in ("compact", "comfortable") else "comfortable"
+    CURRENT_RADIUS = min(18, max(0, _i(settings.get("radius"), 10)))
+    ANIMATIONS = bool(settings.get("animations", True))
+    BADGES = bool(settings.get("badges", True))
+    compact = (CURRENT_DENSITY == "compact")
+    GlassTable.ROW_H = 24 if compact else 30
+    GlassTable.HEAD_H = 26 if compact else 32
 
 
 def _hex_rgb(h):
@@ -2424,13 +2468,24 @@ def _mix_hex(c1, c2, ratio=0.5):
     return _rgb_hex(tuple(a[i] * ratio + b[i] * (1 - ratio) for i in range(3)))
 
 
-def set_theme(name):
-    global _c, BG, CARD, TEXT, MUTED, ACCENT, DANGER, HEAD, SEL, FIELD, BORDER, CURRENT_THEME
-    _c = THEMES.get(name, THEMES["light"])
-    BG, CARD, TEXT, MUTED = _c["BG"], _c["CARD"], _c["TEXT"], _c["MUTED"]
-    ACCENT, DANGER, HEAD, SEL = _c["ACCENT"], _c["DANGER"], _c["HEAD"], _c["SEL"]
-    FIELD, BORDER = _c["FIELD"], _c["BORDER"]
+def set_theme(name, accent=None):
+    """应用主题 + 个性化强调色; accent=None 时沿用当前选择。"""
+    global _c, BG, CARD, CARD2, TEXT, MUTED, ACCENT, DANGER, HEAD, SEL
+    global FIELD, BORDER, RING, OK, WARN, GHOST, CURRENT_THEME, CURRENT_ACCENT
     CURRENT_THEME = name if name in THEMES else "light"
+    if accent in ACCENTS:
+        CURRENT_ACCENT = accent
+    _c = THEMES[CURRENT_THEME]
+    BG, CARD, CARD2 = _c["BG"], _c["CARD"], _c["CARD2"]
+    TEXT, MUTED = _c["TEXT"], _c["MUTED"]
+    DANGER, HEAD = _c["DANGER"], _c["HEAD"]
+    FIELD, BORDER, RING = _c["FIELD"], _c["BORDER"], _c["RING"]
+    OK, WARN = _c["OK"], _c["WARN"]
+    base = ACCENTS[CURRENT_ACCENT][0]
+    # 暗色下把强调色提亮, 保证在深色卡片上的对比度
+    ACCENT = _mix_hex(base, "#ffffff", 0.75) if CURRENT_THEME == "dark" else base
+    SEL = _mix_hex(ACCENT, CARD, 0.18)
+    GHOST = _mix_hex(ACCENT, CARD, 0.07)
     return CURRENT_THEME
 
 
@@ -2445,36 +2500,53 @@ def apply_theme(root):
     st.configure("TFrame", background=BG)
     st.configure("TLabel", background=BG, foreground=TEXT)
     st.configure("Card.TFrame", background=CARD, relief="flat")
-    st.configure("TLabelframe", background=BG, bordercolor=BORDER)
+    st.configure("Card2.TFrame", background=CARD2, relief="flat")
+    st.configure("TLabelframe", background=BG, bordercolor=RING)
     st.configure("TLabelframe.Label", background=BG, foreground=TEXT)
-    st.configure("TButton", padding=(10, 6), background=CARD, foreground=TEXT,
+    # v1.5: 字号层级 / 提示文字 / 徽标样式
+    st.configure("Title.TLabel", background=BG, foreground=TEXT,
+                 font=("Microsoft YaHei UI", 16, "bold"))
+    st.configure("Section.TLabel", background=BG, foreground=TEXT,
+                 font=("Microsoft YaHei UI", 10, "bold"))
+    st.configure("Hint.TLabel", background=BG, foreground=MUTED,
+                 font=("Microsoft YaHei UI", 9))
+    st.configure("Badge.TLabel", background=CARD2, foreground=TEXT,
+                 font=("Microsoft YaHei UI", 9, "bold"), padding=(8, 3))
+    compact = (CURRENT_DENSITY == "compact")
+    st.configure("TButton", padding=(8, 4) if compact else (11, 7),
+                 background=CARD, foreground=TEXT,
                  bordercolor=BORDER, lightcolor=CARD, darkcolor=CARD)
-    st.map("TButton", background=[("active", HEAD), ("disabled", BG)],
+    st.map("TButton", background=[("active", GHOST), ("disabled", BG)],
            foreground=[("disabled", MUTED)])
     st.configure("Accent.TButton", background=ACCENT, foreground="#ffffff",
-                 borderwidth=0, padding=(12, 6))
-    st.map("Accent.TButton", background=[("active", ACCENT)])
+                 borderwidth=0, padding=(12, 5) if compact else (14, 8))
+    st.map("Accent.TButton", background=[("active", _mix_hex(ACCENT, "#ffffff", 0.15))])
     st.configure("Danger.TButton", background=DANGER, foreground="#ffffff",
-                 borderwidth=0, padding=(14, 8))
+                 borderwidth=0, padding=(12, 5) if compact else (14, 8))
     st.map("Danger.TButton", background=[("active", DANGER)])
     st.configure("TCheckbutton", background=BG, foreground=TEXT, indicatorcolor=FIELD)
     st.map("TCheckbutton", background=[("active", BG)], indicatorcolor=[("selected", ACCENT)])
     st.configure("TRadiobutton", background=BG, foreground=TEXT, indicatorcolor=FIELD)
     st.map("TRadiobutton", background=[("active", BG)], indicatorcolor=[("selected", ACCENT)])
     st.configure("TEntry", fieldbackground=FIELD, foreground=TEXT,
-                 bordercolor=BORDER, insertcolor=TEXT)
+                 bordercolor=RING, lightcolor=RING, darkcolor=RING,
+                 insertcolor=ACCENT, padding=(6, 3))
     st.configure("TSpinbox", fieldbackground=FIELD, foreground=TEXT,
-                 bordercolor=BORDER, background=FIELD, arrowcolor=TEXT)
+                 bordercolor=RING, background=FIELD, arrowcolor=TEXT,
+                 lightcolor=RING, darkcolor=RING)
     st.configure("TCombobox", fieldbackground=FIELD, foreground=TEXT,
-                 background=FIELD, bordercolor=BORDER, arrowcolor=TEXT)
+                 background=FIELD, bordercolor=RING, arrowcolor=TEXT,
+                 lightcolor=RING, darkcolor=RING, padding=(6, 3))
     st.configure("TNotebook", background=BG, bordercolor=BORDER)
-    st.configure("TNotebook.Tab", background=HEAD, foreground=TEXT, padding=(12, 6))
+    st.configure("TNotebook.Tab", background=HEAD, foreground=TEXT,
+                 padding=(12, 5) if compact else (14, 7))
     st.map("TNotebook.Tab", background=[("selected", CARD)])
     st.configure("TSeparator", background=BORDER)
-    st.configure("TScrollbar", background=BG, troughcolor=BG, bordercolor=BORDER,
-                 arrowcolor=TEXT)
+    st.configure("TScrollbar", background=CARD2, troughcolor=BG, bordercolor=BORDER,
+                 arrowcolor=MUTED)
     st.configure("Treeview", background=CARD, fieldbackground=CARD,
-                 foreground=TEXT, rowheight=28, borderwidth=0, bordercolor=BORDER)
+                 foreground=TEXT, rowheight=24 if compact else 28,
+                 borderwidth=0, bordercolor=BORDER)
     st.configure("Treeview.Heading", background=HEAD, foreground=TEXT,
                  font=("Microsoft YaHei UI", 9, "bold"), bordercolor=BORDER)
     st.map("Treeview", background=[("selected", SEL)], foreground=[("selected", TEXT)])
@@ -2499,6 +2571,39 @@ def apply_theme(root):
 def _rgba(hex_color, alpha):
     """把 #rrggbb 转成 PIL 用的 (r,g,b,a)。"""
     return _hex_rgb(hex_color) + (max(0, min(255, int(alpha))),)
+
+
+def _round_rect(draw, box, radius, fill):
+    """圆角矩形; 兼容没有 rounded_rectangle 的老 Pillow。"""
+    if radius <= 0:
+        draw.rectangle(box, fill=fill)
+        return
+    try:
+        draw.rounded_rectangle(box, radius=radius, fill=fill)
+        return
+    except (TypeError, AttributeError):
+        pass
+    x0, y0, x1, y1 = box
+    r = max(0, min(int(radius), (x1 - x0) // 2, (y1 - y0) // 2))
+    draw.rectangle([x0 + r, y0, x1 - r, y1], fill=fill)
+    draw.rectangle([x0, y0 + r, x1, y1 - r], fill=fill)
+    draw.ellipse([x0, y0, x0 + 2 * r, y0 + 2 * r], fill=fill)
+    draw.ellipse([x1 - 2 * r, y0, x1, y0 + 2 * r], fill=fill)
+    draw.ellipse([x0, y1 - 2 * r, x0 + 2 * r, y1], fill=fill)
+    draw.ellipse([x1 - 2 * r, y1 - 2 * r, x1, y1], fill=fill)
+
+
+def _round_pill(cv, x0, y0, x1, y1, r, fill):
+    """tk.Canvas 上画纯色圆角胶囊(4 个圆 + 2 个矩形)。"""
+    r = max(0, min(int(r), (x1 - x0) // 2, (y1 - y0) // 2))
+    if r <= 0:
+        cv.create_rectangle(x0, y0, x1, y1, fill=fill, outline=fill)
+        return
+    cv.create_rectangle(x0 + r, y0, x1 - r, y1, fill=fill, outline=fill)
+    cv.create_rectangle(x0, y0 + r, x1, y1 - r, fill=fill, outline=fill)
+    for ax, ay in ((x0, y0), (x1 - 2 * r, y0),
+                   (x0, y1 - 2 * r), (x1 - 2 * r, y1 - 2 * r)):
+        cv.create_oval(ax, ay, ax + 2 * r, ay + 2 * r, fill=fill, outline=fill)
 
 
 class GlassTable(tk.Frame):
@@ -2533,12 +2638,15 @@ class GlassTable(tk.Frame):
         self._yscroll_cb = None
         self._pending = False
         self._bg_photo = None
+        self._hover = -1
         self._font = tkfont.Font(family="Microsoft YaHei UI", size=9)
         self._head_font = tkfont.Font(family="Microsoft YaHei UI", size=9, weight="bold")
         self.canvas = tk.Canvas(self, highlightthickness=0, bd=0, bg=CARD)
         self.canvas.pack(side="left", fill="both", expand=True)
         self.canvas.bind("<Button-1>", self._on_click)
         self.canvas.bind("<MouseWheel>", self._on_wheel)
+        self.canvas.bind("<Motion>", self._on_motion)
+        self.canvas.bind("<Leave>", self._on_leave)
         self.canvas.bind("<Configure>", lambda e: self._schedule())
 
     # ---- ttk.Treeview 兼容 API ----
@@ -2699,6 +2807,22 @@ class GlassTable(tk.Frame):
         self.yview("scroll", n * 3, "units")
         return "break"
 
+    def _on_motion(self, event):
+        if event.y < self.HEAD_H:
+            idx = -1
+        else:
+            idx = int((event.y - self.HEAD_H + self._offset) // self.ROW_H)
+            if not (0 <= idx < len(self._rows)):
+                idx = -1
+        if idx != self._hover:
+            self._hover = idx
+            self._schedule()
+
+    def _on_leave(self, event):
+        if self._hover != -1:
+            self._hover = -1
+            self._schedule()
+
     def _glass_base(self, w, h):
         """返回 (是否半透明模式, RGB 底图)。半透明时从整窗磨砂图裁出本控件对应区域。"""
         from PIL import Image
@@ -2751,11 +2875,17 @@ class GlassTable(tk.Frame):
 
         ov = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         d = ImageDraw.Draw(ov)
-        # 表头: 半透明模式只叠薄薄一层, 背景纹理仍可见
-        d.rectangle([0, 0, w, self.HEAD_H], fill=_rgba(HEAD, 150 if glass else 255))
-        d.line([(0, self.HEAD_H - 1), (w, self.HEAD_H - 1)],
-               fill=_rgba(BORDER, 140 if glass else 255), width=1)
-        # 行带: 交替底色用低 alpha, 保证文字可读又不挡住背景图
+        rad = CURRENT_RADIUS
+        # 表头: 圆角胶囊, 半透明模式只叠薄薄一层, 背景纹理仍可见
+        _round_rect(d, [3, 2, w - 3, self.HEAD_H - 3],
+                    min(rad, self.HEAD_H // 2),
+                    _rgba(HEAD, 170 if glass else 255))
+        x = 0
+        for ci in range(len(cols) - 1):
+            x += widths[ci]
+            d.line([(x, 9), (x, self.HEAD_H - 9)],
+                   fill=_rgba(RING, 90 if glass else 170), width=1)
+        # 行: 独立圆角条(轻微内缩), 悬浮 / 选中 / 斑马纹
         first = max(0, int(self._offset // self.ROW_H))
         for i in range(first, len(self._rows)):
             yy = int(self.HEAD_H + i * self.ROW_H - self._offset)
@@ -2763,17 +2893,20 @@ class GlassTable(tk.Frame):
                 break
             if yy + self.ROW_H < self.HEAD_H:
                 continue
+            box = [4, yy + 1, w - 4, yy + self.ROW_H - 2]
+            r = min(rad, 9, max(0, (box[3] - box[1]) // 2))
             selected = self._rows[i]["iid"] == self._sel
             if selected:
-                # 高亮只叠薄薄一层, 背景图仍在; 左侧加一条实色强调条便于辨识
-                d.rectangle([0, yy, w, yy + self.ROW_H - 1],
-                            fill=_rgba(SEL if not glass else ACCENT, 90 if glass else 255))
-                d.rectangle([0, yy, 3, yy + self.ROW_H - 1], fill=_rgba(ACCENT, 255))
+                _round_rect(d, box, r,
+                            _rgba(SEL if not glass else ACCENT, 115 if glass else 255))
+                _round_rect(d, [6, yy + 4, 9, yy + self.ROW_H - 5], 2,
+                            _rgba(ACCENT, 255))
+            elif i == self._hover:
+                _round_rect(d, box, r, _rgba(GHOST, 165 if glass else 255))
             elif i % 2:
-                d.rectangle([0, yy, w, yy + self.ROW_H - 1],
-                            fill=_rgba(CARD if glass else HEAD, 55 if glass else 150))
-            d.line([(0, yy + self.ROW_H - 1), (w, yy + self.ROW_H - 1)],
-                   fill=_rgba(BORDER, 70 if glass else 150), width=1)
+                _round_rect(d, box, r, _rgba(CARD2 if glass else HEAD, 70 if glass else 170))
+            elif glass:
+                _round_rect(d, box, r, _rgba(CARD, 38))
         comp = Image.alpha_composite(base.convert("RGBA"), ov).convert("RGB")
         self._bg_photo = ImageTk.PhotoImage(comp)
         cv.create_image(0, 0, anchor="nw", image=self._bg_photo, tags="__glassbg__")
@@ -2782,7 +2915,7 @@ class GlassTable(tk.Frame):
         for ci, c in enumerate(cols):
             x0 = sum(widths[:ci])
             anchor = self._anchors.get(c, "w")
-            tx = x0 + widths[ci] / 2.0 if anchor == "center" else x0 + 8
+            tx = x0 + widths[ci] / 2.0 if anchor == "center" else x0 + 10
             cv.create_text(tx, self.HEAD_H / 2.0, text=self._heads.get(c, c),
                            anchor=anchor, font=self._head_font, fill=TEXT)
         for i in range(first, len(self._rows)):
@@ -2802,8 +2935,11 @@ class GlassTable(tk.Frame):
                 val = str(row["values"][ci]) if ci < len(row["values"]) else ""
                 x0 = sum(widths[:ci])
                 anchor = self._anchors.get(c, "w")
-                tx = x0 + widths[ci] / 2.0 if anchor == "center" else x0 + 8
-                cv.create_text(tx, cy, text=self._clip(val, widths[ci] - 14),
+                tx = x0 + widths[ci] / 2.0 if anchor == "center" else x0 + 10
+                if BADGES and ci == 0 and tag:
+                    dot = OK if tag == "running" else (WARN if tag == "waiting" else MUTED)
+                    cv.create_oval(x0 + 8, cy - 4, x0 + 16, cy + 4, fill=dot, outline="")
+                cv.create_text(tx, cy, text=self._clip(val, widths[ci] - 18),
                                anchor=anchor, font=font, fill=color)
         self._update_scrollbar()
 
@@ -4383,6 +4519,13 @@ class SettingsDialog(object):
         self._old_theme = config.settings.get("theme", "light")
         self._old_opacity = _i(config.settings.get("background_opacity"), 45)
         self._old_background = config.settings.get("background", "")
+        self._old_personal = {
+            "accent": config.settings.get("accent", "blue"),
+            "density": config.settings.get("density", "comfortable"),
+            "radius": _i(config.settings.get("radius"), 10),
+            "animations": bool(config.settings.get("animations", True)),
+            "badges": bool(config.settings.get("badges", True)),
+        }
         self.top = tk.Toplevel(parent)
         self.top.title("设置")
         self.top.configure(bg=BG)
@@ -4401,12 +4544,21 @@ class SettingsDialog(object):
         self.script_var = tk.BooleanVar(value=bool(st.get("script_enabled", False)))
         self.restore_var = tk.BooleanVar(value=bool(st.get("restore_cursor", True)))
         self.new_em = st.get("emergency_hotkey")
+        # v1.5 个性化
+        self._accent_keys = list(ACCENTS.keys())
+        self.accent_var = tk.StringVar(value=self._old_personal["accent"])
+        self.density_var = tk.StringVar(value=self._old_personal["density"])
+        self.radius_var = tk.IntVar(value=self._old_personal["radius"])
+        self.anim_var = tk.BooleanVar(value=self._old_personal["animations"])
+        self.badge_var = tk.BooleanVar(value=self._old_personal["badges"])
+        self._radius_label = tk.StringVar(value="%d px" % self._old_personal["radius"])
 
         nb = ttk.Notebook(self.top)
         nb.pack(fill="both", expand=True, padx=14, pady=14)
-        f1, f2, f3, f4 = (ttk.Frame(nb, padding=16) for _ in range(4))
+        f1, f2, f5, f3, f4 = (ttk.Frame(nb, padding=16) for _ in range(5))
         nb.add(f1, text="常规")
         nb.add(f2, text="外观")
+        nb.add(f5, text="个性化")
         nb.add(f3, text="高级")
         nb.add(f4, text="关于")
 
@@ -4489,6 +4641,61 @@ class SettingsDialog(object):
             row=row, column=0, columnspan=3, sticky="w")
         f2.columnconfigure(1, weight=1)
 
+        # ---- 个性化 (v1.5) ----
+        row = 0
+        ttk.Label(f5, text="强调色", font=("Microsoft YaHei UI", 10, "bold")).grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        row += 1
+        abox = ttk.Frame(f5)
+        abox.grid(row=row, column=0, columnspan=3, sticky="w")
+        self.accent_combo = ttk.Combobox(abox, state="readonly", width=13,
+                                         values=[ACCENTS[k][1] for k in self._accent_keys])
+        try:
+            self.accent_combo.current(self._accent_keys.index(self.accent_var.get()))
+        except Exception:
+            self.accent_combo.current(0)
+        self.accent_combo.pack(side="left")
+        self.accent_combo.bind("<<ComboboxSelected>>", lambda e: self._preview_personal())
+        self._accent_swatch = tk.Canvas(abox, width=30, height=22,
+                                        highlightthickness=0, bd=0, bg=BG)
+        self._accent_swatch.pack(side="left", padx=(10, 0))
+        ttk.Label(abox, text="按钮 / 链接 / 选中态 / 表格强调条",
+                  foreground=MUTED).pack(side="left", padx=(10, 0))
+        row += 1
+        ttk.Separator(f5).grid(row=row, column=0, columnspan=3, sticky="ew", pady=12)
+        row += 1
+        ttk.Label(f5, text="界面密度").grid(row=row, column=0, sticky="w", pady=6)
+        dbox = ttk.Frame(f5)
+        dbox.grid(row=row, column=1, columnspan=2, sticky="w")
+        ttk.Radiobutton(dbox, text="舒适", value="comfortable", variable=self.density_var,
+                        command=self._preview_personal).pack(side="left")
+        ttk.Radiobutton(dbox, text="紧凑（行高更小、留白更少）", value="compact",
+                        variable=self.density_var,
+                        command=self._preview_personal).pack(side="left", padx=(12, 0))
+        row += 1
+        ttk.Label(f5, text="圆角半径").grid(row=row, column=0, sticky="w", pady=6)
+        rbox = ttk.Frame(f5)
+        rbox.grid(row=row, column=1, columnspan=2, sticky="ew")
+        ttk.Scale(rbox, from_=0, to=18, orient="horizontal", variable=self.radius_var,
+                  command=lambda v: self._preview_personal()).pack(side="left", fill="x", expand=True)
+        ttk.Label(rbox, textvariable=self._radius_label, width=6).pack(side="left", padx=(8, 0))
+        row += 1
+        ttk.Separator(f5).grid(row=row, column=0, columnspan=3, sticky="ew", pady=12)
+        row += 1
+        ttk.Checkbutton(f5, text="动态切换（主题渐变、分区指示条滑动）",
+                        variable=self.anim_var, command=self._preview_personal).grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=3)
+        row += 1
+        ttk.Checkbutton(f5, text="显示状态徽标与表格状态色点",
+                        variable=self.badge_var, command=self._preview_personal).grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=3)
+        row += 1
+        ttk.Label(f5, text="所有改动即时预览；取消设置会还原，点「保存」才写入配置。",
+                  foreground=MUTED, wraplength=420, justify="left").grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        f5.columnconfigure(1, weight=1)
+        self._preview_personal()
+
         row = 0
         ttk.Checkbutton(f3, text="启用高级脚本（类 C 伪代码）", variable=self.script_var).grid(
             row=row, column=0, columnspan=3, sticky="w", pady=(0, 2))
@@ -4511,8 +4718,9 @@ class SettingsDialog(object):
         ttk.Button(b3, text="脚本编辑器", command=self._script).pack(side="left", padx=(8, 0))
         ttk.Button(b3, text="C++ 编译路径说明", command=self._cpp).pack(side="left", padx=(8, 0))
         row += 1
-        ttk.Label(f3, text="高级版目标为单文件、零额外依赖的 C++ 实现；仓库 docs/ 下提供"
-                            "可直接编译的骨架与数据包级点击的设计规划。",
+        ttk.Label(f3, text="C++ 改版已是独立产品线：仓库 cpp/ 下提供代码工作台"
+                            "（真 C++ 编写 + 一键真编译）与完整源码；docs/CPP_PATH.md "
+                            "记录编译路径与数据包级点击的规划。",
                   foreground=MUTED, wraplength=400, justify="left").grid(
             row=row, column=0, columnspan=3, sticky="w", pady=(10, 0))
         f3.columnconfigure(1, weight=1)
@@ -4561,6 +4769,33 @@ class SettingsDialog(object):
         self.op_label.set("%d%%" % v)
         if self.app:
             self.app.preview_opacity(v)
+
+    def _preview_personal(self, *_):
+        """个性化即时预览: 强调色 / 密度 / 圆角 / 动画 / 徽标。"""
+        try:
+            i = self.accent_combo.current()
+            if 0 <= i < len(self._accent_keys):
+                self.accent_var.set(self._accent_keys[i])
+        except Exception:
+            pass
+        radius = min(18, max(0, _i(self.radius_var.get(), 10)))
+        try:
+            self._radius_label.set("%d px" % radius)
+            sw = self._accent_swatch
+            sw.configure(bg=BG)
+            sw.delete("all")
+            col = ACCENTS.get(self.accent_var.get(), ACCENTS["blue"])[0]
+            _round_pill(sw, 1, 1, 29, 21, min(radius, 8), col)
+        except Exception:
+            pass
+        if self.app:
+            self.app.preview_personal({
+                "accent": self.accent_var.get(),
+                "density": self.density_var.get(),
+                "radius": radius,
+                "animations": bool(self.anim_var.get()),
+                "badges": bool(self.badge_var.get()),
+            })
 
     def _browse_bg(self):
         from tkinter import filedialog
@@ -4655,6 +4890,11 @@ class SettingsDialog(object):
         s["script_enabled"] = bool(self.script_var.get())
         s["restore_cursor"] = bool(self.restore_var.get())
         s["background_opacity"] = min(90, max(10, _i(self.op_var.get(), 45)))
+        s["accent"] = self.accent_var.get()
+        s["density"] = self.density_var.get()
+        s["radius"] = min(18, max(0, _i(self.radius_var.get(), 10)))
+        s["animations"] = bool(self.anim_var.get())
+        s["badges"] = bool(self.badge_var.get())
         autostart_set(s["autostart"], hidden=s["start_hidden"])
         self.config.save()
         self.ok = True
@@ -4666,6 +4906,7 @@ class SettingsDialog(object):
     def _close(self):
         if not self.ok and self.app:
             try:
+                self.app.preview_personal(self._old_personal)
                 self.app.preview_theme(self._old_theme)
                 self.app.config.settings["background_opacity"] = self._old_opacity
                 self.app.preview_background(self._old_background)
@@ -4693,7 +4934,9 @@ class App(object):
         self.root.geometry("1000x620")
         self.root.minsize(860, 500)
         self.root.configure(bg=BG)
-        set_theme(config.settings.get("theme", "light"))
+        apply_personal(config.settings)
+        set_theme(config.settings.get("theme", "light"),
+                  config.settings.get("accent"))
         try:
             os.makedirs(PICTURES_DIR, exist_ok=True)
         except Exception:
@@ -4762,6 +5005,7 @@ class App(object):
         self._frosted_image, self._frosted_photo = None, None
         self._reset_glass()
         self._paint_tabs()
+        self._refresh_badges()
         self._redraw_glass_tables()
 
     def _redraw_glass_tables(self):
@@ -4899,7 +5143,9 @@ class App(object):
         self._redraw_glass_tables()
 
     def apply_settings(self):
-        set_theme(self.config.settings.get("theme", "light"))
+        apply_personal(self.config.settings)
+        set_theme(self.config.settings.get("theme", "light"),
+                  self.config.settings.get("accent"))
         self._restyle()
 
     # ---- 界面 ----
@@ -4908,23 +5154,33 @@ class App(object):
         self._layout_outer()
         panel = self.outer
 
-        head = ttk.Frame(panel, padding=(16, 12, 16, 6), style="Glass.TFrame")
+        head = ttk.Frame(panel, padding=(18, 14, 18, 8), style="Glass.TFrame")
         head.pack(fill="x")
-        ttk.Label(head, text=APP_NAME, font=("Microsoft YaHei UI", 15, "bold"),
+        ttk.Label(head, text=APP_NAME, font=("Microsoft YaHei UI", 17, "bold"),
                   foreground=TEXT, style="Glass.TLabel").pack(side="left")
-        self.state_label = ttk.Label(head, text="就绪", foreground=MUTED, style="Glass.TLabel")
-        self.state_label.pack(side="left", padx=(12, 0))
-        self.total_label = ttk.Label(head, text="总点击 0", foreground=ACCENT,
-                                     style="Glass.TLabel")
-        self.total_label.pack(side="left", padx=(12, 0))
-        for text, cmd, w in (("关于", self.open_about, 6), ("设置", self.open_settings, 8),
-                             ("库", self.open_library, 5), ("脚本动作", self.add_script_binding, 10),
-                             ("隐藏", self.hide_window, 7)):
-            ttk.Button(head, text=text, command=cmd, width=w).pack(side="right", padx=(0, 6))
+        ttk.Label(head, text="· 连点工作台", foreground=MUTED,
+                  style="Glass.TLabel").pack(side="left", padx=(8, 0))
+        # 圆角状态徽标
+        self._badge_state = tk.Canvas(head, width=100, height=24,
+                                      highlightthickness=0, bd=0, bg=BG)
+        self._badge_state._ac_text = "就绪"
+        self._badge_state.pack(side="left", padx=(14, 0))
+        self._badge_total = tk.Canvas(head, width=108, height=24,
+                                      highlightthickness=0, bd=0, bg=BG)
+        self._badge_total._ac_text = "总点击 0"
+        self._badge_total.pack(side="left", padx=(8, 0))
+        for text, cmd, w, sty in (("关于", self.open_about, 6, "TButton"),
+                                  ("设置", self.open_settings, 7, "Accent.TButton"),
+                                  ("库", self.open_library, 5, "TButton"),
+                                  ("脚本动作", self.add_script_binding, 10, "TButton"),
+                                  ("隐藏", self.hide_window, 6, "TButton")):
+            ttk.Button(head, text=text, command=cmd, width=w,
+                       style=sty).pack(side="right", padx=(0, 6))
 
-        preset_bar = ttk.Frame(panel, padding=(16, 2), style="Glass.TFrame")
+        preset_bar = ttk.Frame(panel, padding=(18, 4), style="Glass.TFrame")
         preset_bar.pack(fill="x")
-        ttk.Label(preset_bar, text="当前方案", style="Glass.TLabel").pack(side="left")
+        ttk.Label(preset_bar, text="方案", font=("Microsoft YaHei UI", 9, "bold"),
+                  foreground=MUTED, style="Glass.TLabel").pack(side="left", padx=(0, 4))
         self.preset_var = tk.StringVar()
         self.preset_combo = ttk.Combobox(preset_bar, textvariable=self.preset_var,
                                          state="readonly", width=24)
@@ -4932,27 +5188,25 @@ class App(object):
         self.preset_combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
         ttk.Button(preset_bar, text="另存为…", command=self.save_preset).pack(side="left", padx=(8, 0))
         ttk.Button(preset_bar, text="保存当前", command=self.update_preset).pack(side="left", padx=(6, 0))
-        ttk.Button(preset_bar, text="⏹ 紧急停止(全部)", command=self.emergency_stop,
+        ttk.Button(preset_bar, text="紧急停止(全部)", command=self.emergency_stop,
                    style="Danger.TButton").pack(side="right")
         self._refresh_presets()
 
-        # 自制分区标签: ttk.Notebook 的 client 由 clam 引擎自绘不透明底色,
-        # 会整块挡住背景图, 因此改用可色键透明的普通 Frame + 标签按钮。
+        # 圆角胶囊分区标签(单 Canvas 自绘): ttk.Notebook 的 client 自绘不透明,
+        # 会整块挡住背景图; Canvas 胶囊既能透明配合背景, 又能做滑动指示条。
         tabbar = ttk.Frame(panel, style="Glass.TFrame")
-        tabbar.pack(fill="x", padx=(16, 16), pady=(8, 0))
-        self._tab_labels = {}
-        for key, text in (("basic", "  基础点击  "), ("flow", "  节点循环  ")):
-            lab = tk.Label(tabbar, text=text, cursor="hand2", padx=8, pady=5,
-                           font=("Microsoft YaHei UI", 10),
-                           bg=BG, fg=TEXT, bd=0, highlightthickness=0)
-            lab.pack(side="left")
-            lab.bind("<Button-1>", lambda e, k=key: self._switch_tab(k))
-            self._tab_labels[key] = lab
+        tabbar.pack(fill="x", padx=(18, 18), pady=(10, 0))
+        self._tab_canvas = tk.Canvas(tabbar, height=36, highlightthickness=0, bd=0, bg=BG)
+        self._tab_canvas.pack(fill="x")
+        self._tab_canvas.bind("<Button-1>", self._on_tab_click)
+        self._tab_canvas.bind("<Configure>", lambda e: self._paint_tabs())
+        self._tab_boxes = {}
+        self._indicator_x = 4.0
 
         host = ttk.Frame(panel, style="Glass.TFrame")
-        host.pack(fill="both", expand=True, padx=(16, 16), pady=(0, 4))
-        tab1 = ttk.Frame(host, padding=8, style="Glass.TFrame")
-        tab2 = ttk.Frame(host, padding=8, style="Glass.TFrame")
+        host.pack(fill="both", expand=True, padx=(18, 18), pady=(0, 4))
+        tab1 = ttk.Frame(host, padding=10, style="Glass.TFrame")
+        tab2 = ttk.Frame(host, padding=10, style="Glass.TFrame")
         self._tab_frames = {"basic": tab1, "flow": tab2}
         self._build_table(tab1, "basic")
         self._build_table(tab2, "flow")
@@ -4968,7 +5222,7 @@ class App(object):
         self.foot_right.pack(side="right")
         self.author_link = ttk.Label(foot, text="由 %s 制作" % AUTHOR,
                                      style="Link.TLabel", cursor="hand2")
-        self.author_link.pack(side="right", padx=(0, 10))
+        self.author_link.pack(side="right", padx=(0, 20))
         self.author_link.bind("<Button-1>", lambda e: self._open_latest())
         self.author_link.bind("<Enter>",
                               lambda e: self.tip.set("点击查看 GitHub 最新版本页面: %s" % LATEST_URL))
@@ -4996,39 +5250,89 @@ class App(object):
             else:
                 frame.pack_forget()
         self._paint_tabs()
+        box = self._tab_boxes.get(kind)
+        if box:
+            self._animate_indicator(box[0])
         if getattr(self, "_glass_active", False):
             try:
                 self.root.after(60, self._paint_glass_canvases)
             except Exception:
                 pass
 
-    def _paint_tabs(self):
-        """分区标签配色随背景图状态切换。"""
-        labels = getattr(self, "_tab_labels", None)
-        if not labels:            # _setup_background() 早于 _build(), 此时标签还没创建
+    def _on_tab_click(self, event):
+        for k, (x0, y0, x1, y1) in self._tab_boxes.items():
+            if x0 <= event.x <= x1 and y0 <= event.y <= y1:
+                self._switch_tab(k)
+                return
+
+    def _animate_indicator(self, target):
+        """分区指示条滑动过渡; 关闭动画时直接落位。"""
+        if not ANIMATIONS:
+            self._indicator_x = float(target)
+            self._paint_tabs()
             return
-        glass = getattr(self, "_glass_active", False)
-        panel = getattr(self, "_panel_color", BG)
-        for k, lab in labels.items():
-            active = (k == self._active_tab)
+        start = float(self._indicator_x)
+        if abs(target - start) < 0.5:
+            return
+
+        def step(i):
+            if i > 6:
+                return
+            self._indicator_x = start + (target - start) * (i / 6.0)
+            self._paint_tabs()
             try:
-                lab.configure(bg=panel if glass else BG,
-                              fg=ACCENT if active else TEXT,
-                              font=("Microsoft YaHei UI", 10, "bold" if active else "normal"))
+                self.root.after(18, lambda: step(i + 1))
             except Exception:
                 pass
+        step(1)
+
+    def _paint_tabs(self):
+        """圆角胶囊分区标签 + 滑动指示条, 配色随背景图 / 主题刷新。"""
+        cv = getattr(self, "_tab_canvas", None)
+        if cv is None:            # _setup_background() 早于 _build(), 此时还没创建
+            return
+        glass = getattr(self, "_glass_active", False)
+        base = getattr(self, "_panel_color", BG) if glass else BG
+        try:
+            cv.configure(bg=base)
+        except Exception:
+            pass
+        cv.delete("all")
+        h = max(30, cv.winfo_height())
+        tw = 116
+        for i, (key, text) in enumerate((("basic", "  基础点击  "),
+                                         ("flow", "  节点循环  "))):
+            x0 = 4 + i * (tw + 6)
+            box = (x0, 2, x0 + tw, h - 7)
+            self._tab_boxes[key] = box
+            active = (key == getattr(self, "_active_tab", "basic"))
+            r = min(CURRENT_RADIUS, 12)
+            if active:
+                _round_pill(cv, box[0], box[1], box[2], box[3], r, ACCENT)
+            else:
+                _round_pill(cv, box[0], box[1], box[2], box[3], r, RING)
+                _round_pill(cv, box[0] + 1, box[1] + 1, box[2] - 1, box[3] - 1,
+                            max(0, r - 1), CARD)
+            cv.create_text((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0,
+                           text=text, fill="#ffffff" if active else TEXT,
+                           font=("Microsoft YaHei UI", 10, "bold" if active else "normal"))
+        if BADGES:
+            x = float(getattr(self, "_indicator_x", 4.0))
+            _round_pill(cv, x + 8, h - 5, x + tw - 8, h - 3, 1, ACCENT)
 
     def _build_table(self, parent, kind):
         bar = ttk.Frame(parent, style="Glass.TFrame")
-        bar.pack(fill="x", pady=(0, 6))
-        ttk.Button(bar, text="＋ 新增", style="Accent.TButton",
+        bar.pack(fill="x", pady=(0, 8))
+        ttk.Button(bar, text="新增", style="Accent.TButton",
                    command=(self.add_binding if kind == "basic" else self.add_flow)).pack(side="left")
         ttk.Button(bar, text="编辑", width=8,
                    command=(self.edit_binding if kind == "basic" else self.edit_flow)).pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="删除", width=8,
                    command=(self.delete_binding if kind == "basic" else self.delete_flow)).pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="启动 / 停止", width=12,
-                   command=self.toggle_selected).pack(side="left", padx=(14, 0))
+                   command=self.toggle_selected).pack(side="left", padx=(12, 0))
+        ttk.Label(bar, text=("并行独立节奏" if kind == "basic" else "顺序循环流程"),
+                  foreground=MUTED, style="Glass.TLabel").pack(side="right")
         wrap = ttk.Frame(parent, style="Glass.TFrame")
         wrap.pack(fill="both", expand=True)
         cols = ("status", "no", "name", "hotkey", "action", "rate", "mode", "count")
@@ -5048,9 +5352,9 @@ class App(object):
         tree.configure(yscrollcommand=vs.set)
         tree.pack(side="left", fill="both", expand=True)
         vs.pack(side="right", fill="y")
-        tree.tag_configure("running", foreground="#15803d")
+        tree.tag_configure("running", foreground=OK)
         tree.tag_configure("stopped", foreground=MUTED)
-        tree.tag_configure("waiting", foreground="#b45309")
+        tree.tag_configure("waiting", foreground=WARN)
         tree.bind("<Double-1>", lambda e: (self.edit_binding() if kind == "basic" else self.edit_flow()))
         if kind == "basic":
             self.tree = tree
@@ -5059,7 +5363,9 @@ class App(object):
 
     def _update_foot(self):
         try:
-            self.foot_right.configure(text="配置: %s" % CONFIG_FILE)
+            short = os.path.join(os.path.basename(os.path.dirname(CONFIG_FILE)),
+                                 os.path.basename(CONFIG_FILE))
+            self.foot_right.configure(text="配置: %s" % short)
         except Exception:
             pass
 
@@ -5109,14 +5415,20 @@ class App(object):
         self._refresh_table("basic", self.tree, self.config.bindings)
         self._refresh_table("flow", self.flow_tree, self.config.flows)
         n = len(self.engine.running_ids())
-        self.state_label.configure(text=("运行中: %d 组" % n) if n else "就绪",
-                                   foreground="#15803d" if n else MUTED)
-        self.total_label.configure(text="总点击 %d" % self.engine.total_clicks())
+        changed = False
+        for key, txt in (("state", ("运行中 %d 组" % n) if n else "就绪"),
+                         ("total", "总点击 %d" % self.engine.total_clicks())):
+            b = getattr(self, "_badge_" + key, None)
+            if b is not None and getattr(b, "_ac_text", None) != txt:
+                b._ac_text = txt
+                changed = True
+        if changed:
+            self._refresh_badges()
         errs = list(self.engine.hotkeys.errors) + list(self.engine.watcher.errors)
         if errs:
             self.tip.set("⚠ 热键注册失败: " + "、".join(errs))
         else:
-            self.tip.set("双击行编辑；基础=并行独立节奏, 节点=顺序循环；热键按一次开始再按一次停止。")
+            self.tip.set("双击行编辑 · 热键按一次开始、再按一次停止")
         self._sync_tray()
 
     def _on_engine_error(self, msg):
@@ -5361,15 +5673,80 @@ class App(object):
         self._refresh_background()
         for tree in (self.tree, self.flow_tree):
             try:
-                tree.tag_configure("running", foreground="#15803d")
+                tree.tag_configure("running", foreground=OK)
                 tree.tag_configure("stopped", foreground=MUTED)
-                tree.tag_configure("waiting", foreground="#b45309")
+                tree.tag_configure("waiting", foreground=WARN)
             except Exception:
                 pass
+        self._paint_tabs()
+        self._refresh_badges()
+        self._redraw_glass_tables()
 
     def preview_theme(self, name):
-        set_theme(name)
+        """主题切换: 开启动画时做几帧颜色插值, 关闭时直接切换。"""
+        if not ANIMATIONS:
+            set_theme(name)
+            self._restyle()
+            return
+        keys = ("BG", "CARD", "CARD2", "TEXT", "MUTED", "HEAD", "SEL",
+                "FIELD", "BORDER", "RING", "OK", "WARN", "GHOST",
+                "ACCENT", "DANGER")
+        g = globals()
+        start = {k: g[k] for k in keys}
+        try:
+            set_theme(name)
+            target = {k: g[k] for k in keys}
+            for i in range(1, 7):
+                t = i / 6.0
+                for k in keys:
+                    g[k] = _mix_hex(target[k], start[k], t)
+                self._style()
+                self._refresh_background()
+                self._redraw_glass_tables()
+                self._paint_tabs()
+                self._refresh_badges()
+                try:
+                    self.root.update()
+                except Exception:
+                    pass
+        finally:
+            set_theme(name)
+            self._restyle()
+
+    def preview_personal(self, vals):
+        """个性化即时预览(不写配置, 取消时由设置窗口传回旧值还原)。"""
+        merged = dict(self.config.settings)
+        merged.update(vals or {})
+        apply_personal(merged)
+        set_theme(merged.get("theme", "light"), merged.get("accent"))
         self._restyle()
+
+    def _refresh_badges(self):
+        """状态徽标配色随主题 / 强调色 / 运行状态刷新。"""
+        glass = getattr(self, "_glass_active", False)
+        canvas_bg = getattr(self, "_panel_color", BG) if glass else BG
+        running = "运行中" in getattr(getattr(self, "_badge_state", None), "_ac_text", "")
+        for key in ("state", "total"):
+            b = getattr(self, "_badge_" + key, None)
+            if b is None:
+                continue
+            try:
+                b.configure(bg=canvas_bg)
+                b.delete("all")
+                w = max(40, int(b.cget("width")) or 90)
+                h = max(20, int(b.cget("height")) or 24)
+                if key == "state":
+                    fill = _mix_hex(OK, BG, 0.20) if running else _mix_hex(ACCENT, BG, 0.10)
+                    fg = OK if running else TEXT
+                else:
+                    fill, fg = _mix_hex(ACCENT, BG, 0.14), ACCENT
+                r = min(CURRENT_RADIUS, h // 2)
+                _round_pill(b, 0, 0, w, h, r, RING)          # 1px 描边
+                _round_pill(b, 1, 1, w - 1, h - 1, max(0, r - 1), fill)
+                b.create_text(w / 2.0, h / 2.0, text=getattr(b, "_ac_text", ""),
+                              fill=fg, font=("Microsoft YaHei UI", 9, "bold"))
+            except Exception:
+                pass
 
     def preview_background(self, name):
         self.config.settings["background"] = name or ""
@@ -5838,6 +6215,30 @@ def run_selftest():
        "create_image" in _names and "create_text" in _names)
     ck("GlassTable 行带为半透明叠加而非纯色",
        "_rgba" in _names and "alpha_composite" in _names)
+
+    # 18. v1.5.0: 个性化配置 / 强调色 / 动态切换状态
+    _pers = ("accent", "density", "radius", "animations", "badges")
+    ck("默认个性化字段齐全",
+       all(k in default_config()["settings"] for k in _pers))
+    c6 = Config._sanitize({"version": 3, "settings": {
+        "accent": "not-a-color", "density": "huge", "radius": 999}})
+    ck("非法强调色回落 blue", c6["settings"]["accent"] == "blue")
+    ck("非法密度回落 comfortable", c6["settings"]["density"] == "comfortable")
+    ck("圆角上限钳制 18", c6["settings"]["radius"] == 18)
+    ck("强调色方案齐全",
+       all(k in ACCENTS for k in ("blue", "violet", "teal", "rose", "amber")))
+    t1 = set_theme("dark", "teal")
+    dark_accent = ACCENT
+    set_theme("light", "teal")
+    ck("暗色强调色被提亮", t1 == "dark" and dark_accent != ACCENTS["teal"][0])
+    ck("亮色强调色取原值", ACCENT == ACCENTS["teal"][0])
+    apply_personal({"density": "compact", "radius": 6,
+                    "animations": False, "badges": False})
+    ck("紧凑密度改变表格行高", GlassTable.ROW_H == 24, GlassTable.ROW_H)
+    ck("动画/徽标开关写入全局", ANIMATIONS is False and BADGES is False)
+    apply_personal({"density": "comfortable", "radius": 10,
+                    "animations": True, "badges": True})
+    set_theme("light", "blue")
 
     failed = [x for x in lines if x.startswith("FAIL")]
     text = "AutoClicker v%s selftest  %s\n%s\n\n%s\n" % (

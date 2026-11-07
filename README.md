@@ -1,14 +1,37 @@
-# AutoClicker v1.4.6
+# AutoClicker
+
+> 由 **Luo-Jacob** 制作 · <https://github.com/Luo-Jacob/autoclicker> · MIT License
+
+本仓库有**两条独立升级的产品线**，各自的源码、版本号与 Release 互不牵制：
+
+| 产品线 | 目录 | 当前版本 | Release tag | 交付物 | 文档 |
+| --- | --- | --- | --- | --- | --- |
+| **Python GUI 版** | `src/`、`docs/` | `v1.5.0` | `v1.5.x` | `AutoClicker.exe`（约 31 MB） | 本文 |
+| **C++ 工作台** | `cpp/` | `v1.0.0` | `cpp-v1.0.x` | `AutoClickerCPP.exe`（573 KB） | [`cpp/README.md`](cpp/README.md) |
+
+- **Python 版**：开箱即用的完整桌面工具 —— 两分区连点、GUI / 托盘 / 主题 / 背景图 / 方案预设。
+- **C++ 版**：单文件 Win32 代码工作台 —— 写**真 C++ 代码**（不是伪代码），一键调用本机
+  `g++` / `clang++` **真编译**出零依赖、约 42 KB 的连点器 exe。
+
+任一条线都能单独发补丁版，不需要另一条同步升级；[`CHANGELOG.md`](CHANGELOG.md) 按产品线分区记录。
+
+---
+
+## Python GUI 版 v1.5.0
 
 一个 Windows 上的**物理级**鼠标 / 键盘连点器。纯 Win32 `SendInput` 注入，
 主界面分为「基础点击」与「节点循环」两个分区，另带**类 C 伪代码脚本**、多键组合热键、
 定时启动、编号坐标库与方案预设、系统托盘、无控制台窗口。
 
-> 由 **Luo-Jacob** 制作 · 开源地址 <https://github.com/Luo-Jacob/autoclicker> · MIT License
->
 > 使用 Python 3 + tkinter 编写，单文件源码，PyInstaller 打包为单个 exe。
 
----
+### v1.5.0 界面美化
+
+- **圆角卡片与排版** —— 圆角状态徽标、圆角胶囊分区标签、圆角表头与独立圆角行带；统一留白、字号层级与分组标题。
+- **暗色主题细化** —— 重做深色中性底与分层卡片配色，输入框 / 下拉 / 滚动条 / 选中态统一细化，不再是亮色的简单反色。
+- **表格视觉** —— 悬浮行高亮、斑马纹、运行状态色点、圆角选中行与 3px 强调条（自绘表格可深度定制）。
+- **工具栏与徽标** —— 主次按钮分层（主操作蓝色、危险操作红色）、就绪 / 运行中 / 总点击改为彩色圆角徽标。
+- **动态切换与个性化** —— 「设置 → 个性化」可选 5 套强调色、舒适 / 紧凑密度、圆角半径、切换动画与状态徽标开关，全部即时预览；主题切换做颜色插值过渡，分区指示条滑动。
 
 ## 功能
 
@@ -22,7 +45,7 @@
 - **编号坐标库 + 方案预设** —— 坐标按编号引用，改一处全局生效；整套绑定 / 流程 / 坐标可另存为方案并一键切换。
 - **高级脚本** —— 内置类 C 伪代码解释器，无头文件，用户自己写点击代码（默认关闭，需在设置里开启）。
 - **三重急停** —— 可配置全局急停热键（默认 `Ctrl+Alt+K`）、常驻 `Ctrl+Alt+F12`、界面按钮 / 托盘菜单。
-- **其它** —— 亮 / 暗主题、界面背景图、开机启动、关闭窗口行为、配置原子写盘、单实例保护。
+- **其它** —— 亮 / 暗主题（细化配色）、界面背景图（半透明面板 + 自绘表格完整透出）、个性化设置、开机启动、关闭窗口行为、配置原子写盘、单实例保护。
 
 ## 点击模式
 
@@ -183,23 +206,30 @@ Windows 下也可直接双击 `build.bat`。产物在 `dist/AutoClicker.exe`，�
 | 线程模型 | 子线程绝不触碰 tk 控件，统一投递 `UI_QUEUE`，主线程 `after(250)` 轮询消费 |
 | 配置 | `AClib/config.json`，schema v3；v2 配置自动迁移并生成 `#1 默认方案`；写盘用临时文件 + 原子替换 |
 | 托盘 / 主题 / 背景 | `pystray` + Pillow 图标；两套 ttk 配色；Canvas cover 缩放；**面板容器用底层 Canvas + 负偏移绘制半透明磨砂图**（PIL `Image.blend`），不透明度可调 |
-| 主表格 | `GlassTable`：Canvas 自绘 + PIL `alpha_composite` 半透明行带，兼容 Treeview 常用 API；底图取磨砂图裁片，故表格行也透出背景 |
+| 主表格 | `GlassTable`：Canvas 自绘 + PIL `alpha_composite` 半透明圆角行带 / hover / 状态色点，兼容 Treeview 常用 API；底图取磨砂图裁片，故表格行也透出背景 |
+| 个性化 / 动态切换 | `settings` 存 accent / density / radius / animations / badges；`set_theme` 覆盖强调色并在暗色下提亮；主题切换做模块级颜色插值，分区指示条用 `after` 分帧滑动 |
 | 开机启动 / 单实例 | `HKCU\...\Run`；命名 Mutex |
 
-## C++ 单文件与体积
+## C++ 独立产品线
 
-[`docs/CPP_PATH.md`](docs/CPP_PATH.md) 与 [`docs/clicker.cpp`](docs/clicker.cpp) 给出
-**单文件、零额外依赖**的原生 C++ 路径：只链接 `user32`，MSVC `/MT` 或 MinGW `-static -s`
-编译后约 50–200 KB，内置同一套 `rand / left / right / middle / keyboard / pause / hotkey / mouse`。
-同时记录「数据包级点击模拟」的技术路线与取舍（**仅规划，不实现**）。
+v1.5 起 C++ 不再是「文档里的参考骨架」，而是**独立产品线**：见 [`cpp/README.md`](cpp/README.md)。
+[`cpp/studio.cpp`](cpp/studio.cpp) 是单文件 Win32 代码工作台（代码编辑器 + 初始模板 + 编译日志 +
+一键真编译），写的是**真 C++ 代码**（不是伪代码 / 不是自写 DSL 解释器），点「编译」会把内置运行时
+与你的代码合并后调用本机 `g++` / `clang++` 真正编译。
+[`docs/CPP_PATH.md`](docs/CPP_PATH.md) 记录编译命令、迁移说明与「数据包级点击」的规划（**仅规划，不实现**）。
 
-| 方案 | 单文件 | 额外依赖 | 体积 |
+| 产物 | 体积 | 控制台 | DLL 依赖 |
 | --- | --- | --- | --- |
-| `clicker.cpp` | ✅ | 无 | 约 50–200 KB |
-| 主程序（Python onefile） | ✅ | 无 | 约 31 MB |
+| `AutoClickerCPP.exe`（工作台） | 573 KB | 无 | 仅系统 DLL |
+| `AutoClickerScript.exe`（用户脚本产物） | **42 KB** | 无 | KERNEL32 / USER32 / msvcrt |
+| `AutoClicker.exe`（Python onefile） | 约 31 MB | 无 | 已打包 |
 
-> 主程序保留完整 GUI / 托盘 / 三套运行模式，因此体积较大；
-> C++ 骨架面向「只要一段点击逻辑、要极小体积」的场景，两者互补。
+实测（本机 Dev-C++ 自带 MinGW64 `g++ 4.9.2`）：工作台与脚本产物均编译通过，
+PE 子系统为 GUI（无控制台），导入表只有系统 DLL；`--once` 模式真实注入 5 次点击验证通过，
+工作台 UI 的「编译」按钮、语法错误报错、完整源码导出均已实测。
+
+> 手写稿的「≤5 MB」目标 C++ 线已达成；Python 线用体积换完整 GUI / 托盘 / 三套运行模式。
+> 编译器只在**编译时需要**，产物拷到任意 Windows 直接运行，无需 MinGW / VC 运行库。
 
 ## 已知限制
 
@@ -210,7 +240,9 @@ Windows 下也可直接双击 `build.bat`。产物在 `dist/AutoClicker.exe`，�
 - 主表格为自绘 `GlassTable`（非 `ttk.Treeview`）：不支持列宽拖拽、列排序与单元格编辑，选中 / 双击 / 滚轮滚动均可用；对话框内的列表仍是原生 Treeview。
 - `ttk.Notebook` 与 `ttk.Treeview` 的自绘背景无法透明，这是主分区改自制标签、主表格改 Canvas 自绘的原因。
 - 「数据包级点击」只在文档中规划，不提供代码 / 驱动 / 绕过机制。
-- 本机未安装 MSVC / MinGW，仓库中的 `clicker.cpp` 未实测编译（已在文档中注明）。
+- C++ 工作台需要本机已安装 `g++` / `clang++`（工作台不自带编译器，否则违背「单文件极小」目标）；
+  编译产物本身零依赖。旧的 `docs/clicker.cpp` 参考骨架已被 `cpp/runtime_template.cpp` 取代并移除。
+- Python 版主题切换动画是几帧颜色插值，不是 GPU 渐变；可在「设置 → 个性化」关闭。
 
 ## 许可
 

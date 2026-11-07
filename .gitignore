@@ -19,6 +19,13 @@ __pycache__/
 venv/
 env/
 
+# C++ 线: 构建产物 / 用户生成文件 (Release 附件不入库)
+cpp/out/
+cpp/full_source.cpp
+cpp/compiler.ini
+# 由 studio.cpp 经 export_template.py 导出, 运行时只有一份真源
+cpp/runtime_template.cpp
+
 # 编辑器 / 系统
 .vscode/
 .idea/
